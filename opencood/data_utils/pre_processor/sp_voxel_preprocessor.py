@@ -52,7 +52,8 @@ class SpVoxelPreprocessor(BasePreprocessor):
                 vsize_xyz=self.voxel_size,
                 coors_range_xyz=self.lidar_range,
                 max_num_points_per_voxel=self.max_points_per_voxel,
-                num_point_features=4,
+                #num_point_features = args.get('num_point_features', 4),
+                num_point_features=self.params['args']['num_point_features'],
                 max_num_voxels=self.max_voxels
             )
 

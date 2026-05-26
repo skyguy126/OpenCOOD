@@ -81,119 +81,201 @@ class VoxelPostprocessor(BasePostprocessor):
 
         Parameters
         ----------
-        argv : list
-            gt_box_center:(max_num, 7), anchor:(H, W, anchor_num, 7)
+        gt_box_center : np.ndarray
+            Shape: (max_num, 8)
+            Format: [x, y, z, h, w, l, yaw, speed]
+
+        anchors : np.ndarray
+            Shape: (H, W, anchor_num, 7)
+
+        mask : np.ndarray
+            Shape: (max_num)
 
         Returns
         -------
         label_dict : dict
-            Dictionary that contains all target related info.
+            Dictionary that contains target tensors.
         """
-        assert self.params['order'] == 'hwl', 'Currently Voxel only support' \
-                                              'hwl bbx order.'
-        # (max_num, 7)
+        assert self.params['order'] == 'hwl', \
+            'Currently Voxel only supports hwl bbx order.'
+
+        # (max_num, 8)
         gt_box_center = kwargs['gt_box_center']
+
         # (H, W, anchor_num, 7)
         anchors = kwargs['anchors']
+
         # (max_num)
         masks = kwargs['mask']
+
+        # Use 8D box target by default.
+        # 7D = [x, y, z, h, w, l, yaw]
+        # 8D = [x, y, z, h, w, l, yaw, speed]
+        box_code_size = self.params.get('box_code_size', 8)
+
+        # Speed normalization. Add this in yaml:
+        # postprocess:
+        #   box_code_size: 8
+        #   target_args:
+        #     speed_norm: 30.0
+        speed_norm = self.params['target_args'].get('speed_norm', 30.0)
 
         # (H, W)
         feature_map_shape = anchors.shape[:2]
 
         # (H*W*anchor_num, 7)
         anchors = anchors.reshape(-1, 7)
-        # normalization factor, (H * W * anchor_num)
+
+        # Normalization factor, (H*W*anchor_num)
         anchors_d = np.sqrt(anchors[:, 4] ** 2 + anchors[:, 5] ** 2)
 
-        # (H, W, 2)
+        # (H, W, anchor_num)
         pos_equal_one = np.zeros((*feature_map_shape, self.anchor_num))
         neg_equal_one = np.zeros((*feature_map_shape, self.anchor_num))
-        # (H, W, self.anchor_num * 7)
-        targets = np.zeros((*feature_map_shape, self.anchor_num * 7))
 
-        # (n, 7)
+        # (H, W, anchor_num * 8)
+        targets = np.zeros((*feature_map_shape,
+                        self.anchor_num * box_code_size))
+
+        # Only valid GT boxes.
+        # Shape: (n, 8)
         gt_box_center_valid = gt_box_center[masks == 1]
-        # (n, 8, 3)
-        gt_box_corner_valid = \
-            box_utils.boxes_to_corners_3d(gt_box_center_valid,
-                                          self.params['order'])
-        # (H*W*anchor_num, 8, 3)
-        anchors_corner = \
-            box_utils.boxes_to_corners_3d(anchors,
-                                          order=self.params['order'])
-        # (H*W*anchor_num, 4)
-        anchors_standup_2d = \
-            box_utils.corner2d_to_standup_box(anchors_corner)
-        # (n, 4)
-        gt_standup_2d = \
-            box_utils.corner2d_to_standup_box(gt_box_corner_valid)
 
-        # (H*W*anchor_n)
+        # IMPORTANT:
+        # Geometry utilities only understand 7D boxes.
+        # Use [:, :7] for IoU/corner computation.
+        gt_box_center_valid_7d = gt_box_center_valid[:, :7]
+
+        # (n, 8, 3)
+        gt_box_corner_valid = box_utils.boxes_to_corners_3d(
+            gt_box_center_valid_7d,
+            self.params['order']
+        )
+
+        # (H*W*anchor_num, 8, 3)
+        anchors_corner = box_utils.boxes_to_corners_3d(
+            anchors,
+            order=self.params['order']
+        )
+
+        # (H*W*anchor_num, 4)
+        anchors_standup_2d = box_utils.corner2d_to_standup_box(
+            anchors_corner
+        )
+
+        # (n, 4)
+        gt_standup_2d = box_utils.corner2d_to_standup_box(
+            gt_box_corner_valid
+        )
+
+        # (H*W*anchor_num, n)
         iou = bbox_overlaps(
             np.ascontiguousarray(anchors_standup_2d).astype(np.float32),
             np.ascontiguousarray(gt_standup_2d).astype(np.float32),
         )
 
-        # the anchor boxes has the largest iou across
-        # shape: (n)
+        # Anchors with largest IoU for each GT box.
+        # Shape: (n)
         id_highest = np.argmax(iou.T, axis=1)
+
         # [0, 1, 2, ..., n-1]
         id_highest_gt = np.arange(iou.T.shape[0])
-        # make sure all highest iou is larger than 0
+
+        # Make sure all highest IoUs are larger than 0.
         mask = iou.T[id_highest_gt, id_highest] > 0
         id_highest, id_highest_gt = id_highest[mask], id_highest_gt[mask]
 
-        # find anchors iou > params['pos_iou']
-        id_pos, id_pos_gt = \
-            np.where(iou >
-                     self.params['target_args']['pos_threshold'])
-        #  find anchors iou < params['neg_iou']
-        id_neg = np.where(np.sum(iou <
-                                 self.params['target_args']['neg_threshold'],
-                                 axis=1) == iou.shape[1])[0]
+        # Find anchors with IoU > positive threshold.
+        id_pos, id_pos_gt = np.where(
+            iou > self.params['target_args']['pos_threshold']
+        )
+
+        # Find anchors with IoU < negative threshold for all GT boxes.
+        id_neg = np.where(
+            np.sum(
+                iou < self.params['target_args']['neg_threshold'],
+                axis=1
+            ) == iou.shape[1]
+        )[0]
+
         id_pos = np.concatenate([id_pos, id_highest])
         id_pos_gt = np.concatenate([id_pos_gt, id_highest_gt])
+
         id_pos, index = np.unique(id_pos, return_index=True)
         id_pos_gt = id_pos_gt[index]
+
         id_neg.sort()
 
-        # cal the target and set the equal one
+        # Set positive anchors.
         index_x, index_y, index_z = np.unravel_index(
-            id_pos, (*feature_map_shape, self.anchor_num))
+            id_pos,
+            (*feature_map_shape, self.anchor_num)
+        )
         pos_equal_one[index_x, index_y, index_z] = 1
 
-        # calculate the targets
-        targets[index_x, index_y, np.array(index_z) * 7] = \
-            (gt_box_center[id_pos_gt, 0] - anchors[id_pos, 0]) / anchors_d[
-                id_pos]
-        targets[index_x, index_y, np.array(index_z) * 7 + 1] = \
-            (gt_box_center[id_pos_gt, 1] - anchors[id_pos, 1]) / anchors_d[
-                id_pos]
-        targets[index_x, index_y, np.array(index_z) * 7 + 2] = \
-            (gt_box_center[id_pos_gt, 2] - anchors[id_pos, 2]) / anchors[
-                id_pos, 3]
-        targets[index_x, index_y, np.array(index_z) * 7 + 3] = np.log(
-            gt_box_center[id_pos_gt, 3] / anchors[id_pos, 3])
-        targets[index_x, index_y, np.array(index_z) * 7 + 4] = np.log(
-            gt_box_center[id_pos_gt, 4] / anchors[id_pos, 4])
-        targets[index_x, index_y, np.array(index_z) * 7 + 5] = np.log(
-            gt_box_center[id_pos_gt, 5] / anchors[id_pos, 5])
-        targets[index_x, index_y, np.array(index_z) * 7 + 6] = (
-                gt_box_center[id_pos_gt, 6] - anchors[id_pos, 6])
+        # Base channel index for each selected anchor.
+        base = np.array(index_z) * box_code_size
 
+        # x
+        targets[index_x, index_y, base + 0] = (
+            gt_box_center_valid[id_pos_gt, 0] - anchors[id_pos, 0]
+        ) / anchors_d[id_pos]
+
+        # y
+        targets[index_x, index_y, base + 1] = (
+            gt_box_center_valid[id_pos_gt, 1] - anchors[id_pos, 1]
+        ) / anchors_d[id_pos]
+
+        # z
+        targets[index_x, index_y, base + 2] = (
+            gt_box_center_valid[id_pos_gt, 2] - anchors[id_pos, 2]
+        ) / anchors[id_pos, 3]
+
+        # h
+        targets[index_x, index_y, base + 3] = np.log(
+            gt_box_center_valid[id_pos_gt, 3] / anchors[id_pos, 3]
+        )
+
+        # w
+        targets[index_x, index_y, base + 4] = np.log(
+            gt_box_center_valid[id_pos_gt, 4] / anchors[id_pos, 4]
+        )
+
+        # l
+        targets[index_x, index_y, base + 5] = np.log(
+            gt_box_center_valid[id_pos_gt, 5] / anchors[id_pos, 5]
+        )
+
+        # yaw
+        targets[index_x, index_y, base + 6] = (
+            gt_box_center_valid[id_pos_gt, 6] - anchors[id_pos, 6]
+        )
+
+        # speed
+        if box_code_size >= 8:
+            targets[index_x, index_y, base + 7] = (
+                gt_box_center_valid[id_pos_gt, 7] / speed_norm
+            )
+
+        # Set negative anchors.
         index_x, index_y, index_z = np.unravel_index(
-            id_neg, (*feature_map_shape, self.anchor_num))
+            id_neg,
+            (*feature_map_shape, self.anchor_num)
+        )
         neg_equal_one[index_x, index_y, index_z] = 1
 
-        # to avoid a box be pos/neg in the same time
+        # Avoid a box being positive and negative at the same time.
         index_x, index_y, index_z = np.unravel_index(
-            id_highest, (*feature_map_shape, self.anchor_num))
+            id_highest,
+            (*feature_map_shape, self.anchor_num)
+        )
         neg_equal_one[index_x, index_y, index_z] = 0
 
-        label_dict = {'pos_equal_one': pos_equal_one,
-                      'neg_equal_one': neg_equal_one,
-                      'targets': targets}
+        label_dict = {
+            'pos_equal_one': pos_equal_one,
+            'neg_equal_one': neg_equal_one,
+            'targets': targets
+        }
 
         return label_dict
 
@@ -235,36 +317,25 @@ class VoxelPostprocessor(BasePostprocessor):
 
     def post_process(self, data_dict, output_dict):
         """
-        Process the outputs of the model to 2D/3D bounding box.
-        Step1: convert each cav's output to bounding box format
-        Step2: project the bounding boxes to ego space.
-        Step:3 NMS
+        Process model outputs to predicted 3D bounding boxes.
 
-        Parameters
-        ----------
-        data_dict : dict
-            The dictionary containing the origin input data of model.
+        Modified for 8D regression:
+            decoded box = [x, y, z, h, w, l, yaw, speed]
 
-        output_dict :dict
-            The dictionary containing the output of the model.
-
-        Returns
-        -------
-        pred_box3d_tensor : torch.Tensor
-            The prediction bounding box tensor after NMS.
-        gt_box3d_tensor : torch.Tensor
-            The groundtruth bounding box tensor.
+        Geometry/NMS/AP still use only:
+            [x, y, z, h, w, l, yaw]
         """
-        # the final bounding box list
         pred_box3d_list = []
         pred_box2d_list = []
 
+        box_code_size = self.params.get('box_code_size', 8)
+
         for cav_id, cav_content in data_dict.items():
             assert cav_id in output_dict
-            # the transformation matrix to ego space
+
             transformation_matrix = cav_content['transformation_matrix']
 
-            # (H, W, anchor_num, 7)
+            # anchor_box shape: (H, W, anchor_num, 7)
             anchor_box = cav_content['anchor_box']
 
             # classification probability
@@ -275,49 +346,75 @@ class VoxelPostprocessor(BasePostprocessor):
             # regression map
             reg = output_dict[cav_id]['rm']
 
-            # convert regression map back to bounding box
-            # (N, W*L*anchor_num, 7)
+            # Decode regression map.
+            # batch_box3d shape: (N, H*W*anchor_num, 8)
             batch_box3d = self.delta_to_boxes3d(reg, anchor_box)
-            mask = \
-                torch.gt(prob, self.params['target_args']['score_threshold'])
-            mask = mask.view(1, -1)
-            mask_reg = mask.unsqueeze(2).repeat(1, 1, 7)
 
-            # during validation/testing, the batch size should be 1
+            mask = torch.gt(
+                prob,
+                self.params['target_args']['score_threshold']
+            )
+            mask = mask.view(1, -1)
+
+            # Repeat mask for 8D box regression, not 7D.
+            mask_reg = mask.unsqueeze(2).repeat(1, 1, box_code_size)
+
+            # during validation/testing, batch size should be 1
             assert batch_box3d.shape[0] == 1
-            boxes3d = torch.masked_select(batch_box3d[0],
-                                          mask_reg[0]).view(-1, 7)
+
+            # boxes3d_all shape: (num_selected, 8)
+            boxes3d_all = torch.masked_select(
+                batch_box3d[0],
+                mask_reg[0]
+            ).view(-1, box_code_size)
+
             scores = torch.masked_select(prob[0], mask[0])
 
-            # convert output to bounding box
-            if len(boxes3d) != 0:
-                # (N, 8, 3)
-                boxes3d_corner = \
-                    box_utils.boxes_to_corners_3d(boxes3d,
-                                                  order=self.params['order'])
-                # (N, 8, 3)
-                projected_boxes3d = \
-                    box_utils.project_box3d(boxes3d_corner,
-                                            transformation_matrix)
-                # convert 3d bbx to 2d, (N,4)
-                projected_boxes2d = \
-                    box_utils.corner_to_standup_box_torch(projected_boxes3d)
-                # (N, 5)
-                boxes2d_score = \
-                    torch.cat((projected_boxes2d, scores.unsqueeze(1)), dim=1)
+            if len(boxes3d_all) != 0:
+                # Geometry utilities only support 7D boxes.
+                boxes3d = boxes3d_all[:, :7]
+
+                # Optional: keep speed if you want to inspect/save it later.
+                if box_code_size >= 8:
+                    pred_speed = boxes3d_all[:, 7]
+
+                # Convert 7D box to 8 corners.
+                boxes3d_corner = box_utils.boxes_to_corners_3d(
+                    boxes3d,
+                    order=self.params['order']
+                )
+
+                # Project boxes to ego frame.
+                projected_boxes3d = box_utils.project_box3d(
+                    boxes3d_corner,
+                    transformation_matrix
+                )
+
+                # Convert 3D corners to 2D standup boxes.
+                projected_boxes2d = box_utils.corner_to_standup_box_torch(
+                    projected_boxes3d
+                )
+
+                boxes2d_score = torch.cat(
+                    (projected_boxes2d, scores.unsqueeze(1)),
+                    dim=1
+                )
 
                 pred_box2d_list.append(boxes2d_score)
                 pred_box3d_list.append(projected_boxes3d)
 
-        if len(pred_box2d_list) ==0 or len(pred_box3d_list) == 0:
+        if len(pred_box2d_list) == 0 or len(pred_box3d_list) == 0:
             return None, None
-        # shape: (N, 5)
+
         pred_box2d_list = torch.vstack(pred_box2d_list)
+
         # scores
         scores = pred_box2d_list[:, -1]
-        # predicted 3d bbx
+
+        # predicted 3D boxes as corners: (N, 8, 3)
         pred_box3d_tensor = torch.vstack(pred_box3d_list)
-        # remove large bbx
+
+        # remove abnormal boxes
         keep_index_1 = box_utils.remove_large_pred_bbx(pred_box3d_tensor)
         keep_index_2 = box_utils.remove_bbx_abnormal_z(pred_box3d_tensor)
         keep_index = torch.logical_and(keep_index_1, keep_index_2)
@@ -325,20 +422,21 @@ class VoxelPostprocessor(BasePostprocessor):
         pred_box3d_tensor = pred_box3d_tensor[keep_index]
         scores = scores[keep_index]
 
-        # nms
-        keep_index = box_utils.nms_rotated(pred_box3d_tensor,
-                                           scores,
-                                           self.params['nms_thresh']
-                                           )
+        # NMS
+        keep_index = box_utils.nms_rotated(
+            pred_box3d_tensor,
+            scores,
+            self.params['nms_thresh']
+        )
 
         pred_box3d_tensor = pred_box3d_tensor[keep_index]
-
-        # select cooresponding score
         scores = scores[keep_index]
 
-        # filter out the prediction out of the range.
-        mask = \
-            box_utils.get_mask_for_boxes_within_range_torch(pred_box3d_tensor)
+        # filter predictions outside range
+        mask = box_utils.get_mask_for_boxes_within_range_torch(
+            pred_box3d_tensor
+        )
+
         pred_box3d_tensor = pred_box3d_tensor[mask, :, :]
         scores = scores[mask]
 
@@ -346,57 +444,70 @@ class VoxelPostprocessor(BasePostprocessor):
 
         return pred_box3d_tensor, scores
 
-    @staticmethod
-    def delta_to_boxes3d(deltas, anchors, channel_swap=True):
+    def delta_to_boxes3d(self, deltas, anchors, channel_swap=True):
         """
-        Convert the output delta to 3d bbx.
+        Convert model regression output to 3D bounding boxes.
 
-        Parameters
-        ----------
-        deltas : torch.Tensor
-            (N, W, L, 14)
-        anchors : torch.Tensor
-            (W, L, 2, 7) -> xyzhwlr
-        channel_swap : bool
-            Whether to swap the channel of deltas. It is only false when using
-            FPV-RCNN
+        Original:
+            deltas: anchor_num * 7
 
-        Returns
-        -------
-        box3d : torch.Tensor
-            (N, W*L*2, 7)
+        Modified:
+            deltas: anchor_num * 8
+            box = [x, y, z, h, w, l, yaw, speed]
         """
+        box_code_size = self.params.get('box_code_size', 8)
+        speed_norm = self.params['target_args'].get('speed_norm', 30.0)
+
         # batch size
         N = deltas.shape[0]
+
         if channel_swap:
-            deltas = deltas.permute(0, 2, 3, 1).contiguous().view(N, -1, 7)
+            deltas = deltas.permute(0, 2, 3, 1).contiguous()
+            deltas = deltas.view(N, -1, box_code_size)
         else:
-            deltas = deltas.contiguous().view(N, -1, 7)
+            deltas = deltas.contiguous().view(N, -1, box_code_size)
 
         boxes3d = torch.zeros_like(deltas)
+
         if deltas.is_cuda:
             anchors = anchors.cuda()
             boxes3d = boxes3d.cuda()
 
-        # (W*L*2, 7)
+        # anchors are still 7D: [x, y, z, h, w, l, yaw]
         anchors_reshaped = anchors.view(-1, 7).float()
-        # the diagonal of the anchor 2d box, (W*L*2)
+
+        # diagonal of anchor box on BEV plane
         anchors_d = torch.sqrt(
-            anchors_reshaped[:, 4] ** 2 + anchors_reshaped[:, 5] ** 2)
+            anchors_reshaped[:, 4] ** 2 + anchors_reshaped[:, 5] ** 2
+        )
+
         anchors_d = anchors_d.repeat(N, 2, 1).transpose(1, 2)
         anchors_reshaped = anchors_reshaped.repeat(N, 1, 1)
 
-        # Inv-normalize to get xyz
-        boxes3d[..., [0, 1]] = torch.mul(deltas[..., [0, 1]], anchors_d) + \
-                               anchors_reshaped[..., [0, 1]]
-        boxes3d[..., [2]] = torch.mul(deltas[..., [2]],
-                                      anchors_reshaped[..., [3]]) + \
-                            anchors_reshaped[..., [2]]
-        # hwl
-        boxes3d[..., [3, 4, 5]] = torch.exp(
-            deltas[..., [3, 4, 5]]) * anchors_reshaped[..., [3, 4, 5]]
-        # yaw angle
+        # x, y
+        boxes3d[..., [0, 1]] = (
+            deltas[..., [0, 1]] * anchors_d
+            + anchors_reshaped[..., [0, 1]]
+        )
+
+        # z
+        boxes3d[..., [2]] = (
+            deltas[..., [2]] * anchors_reshaped[..., [3]]
+            + anchors_reshaped[..., [2]]
+        )
+
+        # h, w, l
+        boxes3d[..., [3, 4, 5]] = (
+            torch.exp(deltas[..., [3, 4, 5]])
+            * anchors_reshaped[..., [3, 4, 5]]
+        )
+
+        # yaw
         boxes3d[..., 6] = deltas[..., 6] + anchors_reshaped[..., 6]
+
+        # speed
+        if box_code_size >= 8:
+            boxes3d[..., 7] = deltas[..., 7] * speed_norm
 
         return boxes3d
 

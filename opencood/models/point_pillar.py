@@ -17,18 +17,24 @@ class PointPillar(nn.Module):
         super(PointPillar, self).__init__()
 
         # PIllar VFE
-        self.pillar_vfe = PillarVFE(args['pillar_vfe'],
-                                    num_point_features=4,
-                                    voxel_size=args['voxel_size'],
-                                    point_cloud_range=args['lidar_range'])
+        self.pillar_vfe = PillarVFE(
+            args['pillar_vfe'],
+            num_point_features=args['pillar_vfe'].get('num_point_features', 4),
+            voxel_size=args['voxel_size'],
+            point_cloud_range=args['lidar_range']
+        )
         self.scatter = PointPillarScatter(args['point_pillar_scatter'])
         self.backbone = BaseBEVBackbone(args['base_bev_backbone'], 64)
 
         self.cls_head = nn.Conv2d(128 * 3, args['anchor_number'],
                                   kernel_size=1)
-        self.reg_head = nn.Conv2d(128 * 3, 7 * args['anchor_num'],
-                                  kernel_size=1)
+        box_code_size = args.get('box_code_size', 8)
 
+        self.reg_head = nn.Conv2d(
+            128 * 3,
+            box_code_size * args['anchor_number'],
+            kernel_size=1
+        )
     def forward(self, data_dict):
 
         voxel_features = data_dict['processed_lidar']['voxel_features']

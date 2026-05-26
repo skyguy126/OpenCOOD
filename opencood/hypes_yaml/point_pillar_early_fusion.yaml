@@ -1,11 +1,14 @@
 name: point_pillar_early_fusion
-root_dir: "opv2v_data_dumping/train"
-validate_dir: "opv2v_data_dumping/validate"
+# root_dir: "opv2v_data_dumping/train"
+# validate_dir: "opv2v_data_dumping/validate"
+root_dir: "/media/Disk2/data/OPV2V/opv2v_data_dumping/train"
+# validate_dir: "/media/Disk2/data/OPV2V/opv2v_data_dumping/test"
+validate_dir: "/tmp/validate/validate"
 
 yaml_parser: "load_point_pillar_params"
 train_params:
   batch_size: &batch_size 2
-  epoches: 15
+  epoches: 20
   eval_freq: 1
   save_freq: 1
 
@@ -22,6 +25,7 @@ preprocess:
     max_points_per_voxel: 32
     max_voxel_train: 32000
     max_voxel_test: 70000
+    num_point_features: 5
   # lidar range for each individual cav.
   cav_lidar_range: &cav_lidar [-140.8, -40, -3, 140.8, 40, 1]
 
@@ -45,10 +49,12 @@ postprocess:
     h: 1.56
     r: [0, 90]
     num: &achor_num 2
+    box_code_size: 8
   target_args:
     pos_threshold: 0.6
     neg_threshold: 0.45
     score_threshold: 0.20
+    speed_norm: 30.0
   order: 'hwl' # hwl or lwh
   max_num: 100 # maximum number of objects in a single frame. use this number to make sure different frames has the same dimension in the same batch
   nms_thresh: 0.15
@@ -60,10 +66,12 @@ model:
     voxel_size: *voxel_size
     lidar_range: *cav_lidar
     anchor_number: *achor_num
+    box_code_size: 8
     pillar_vfe:
       use_norm: true
       with_distance: false
       use_absolute_xyz: true
+      num_point_features: 5
       num_filters: [64]
     point_pillar_scatter:
       num_features: 64
@@ -82,6 +90,7 @@ loss:
   args:
     cls_weight: 1.0
     reg: 2.0
+    box_code_size: 8
 
 optimizer:
   core_method: Adam

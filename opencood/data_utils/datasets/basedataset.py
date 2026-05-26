@@ -253,13 +253,56 @@ class BaseDataset(Dataset):
             # add time delay to vehicle parameters
             data[cav_id]['time_delay'] = timestamp_delay
             # load the corresponding data into the dictionary
+            # data[cav_id]['params'] = self.reform_param(cav_content,
+            #                                            ego_cav_content,
+            #                                            timestamp_key,
+            #                                            timestamp_key_delay,
+            #                                            cur_ego_pose_flag)
+            # data[cav_id]['lidar_np'] = \
+            #     pcd_utils.pcd_to_np(cav_content[timestamp_key_delay]['lidar'])
+
+            # current / delayed params used by normal OpenCOOD pipeline
             data[cav_id]['params'] = self.reform_param(cav_content,
-                                                       ego_cav_content,
-                                                       timestamp_key,
-                                                       timestamp_key_delay,
-                                                       cur_ego_pose_flag)
+                                                    ego_cav_content,
+                                                    timestamp_key,
+                                                    timestamp_key_delay,
+                                                    cur_ego_pose_flag)
+
+            # current / delayed lidar used by normal OpenCOOD pipeline
             data[cav_id]['lidar_np'] = \
                 pcd_utils.pcd_to_np(cav_content[timestamp_key_delay]['lidar'])
+
+            # ---------------------------------------------------------
+            # Temporal velocity-prediction addition:
+            # Load previous timestep LiDAR + YAML.
+            # ---------------------------------------------------------
+            prev_timestamp_index = max(0, timestamp_index_delay - 1)
+            prev_timestamp_key = self.return_timestamp_key(scenario_database,
+                                                        prev_timestamp_index)
+
+            # Save timestamps for debugging.
+            data[cav_id]['cur_timestamp'] = timestamp_key_delay
+            data[cav_id]['prev_timestamp'] = prev_timestamp_key
+
+            # Load previous lidar.
+            data[cav_id]['prev_lidar_np'] = \
+                pcd_utils.pcd_to_np(cav_content[prev_timestamp_key]['lidar'])
+
+            # Load previous params.
+            # Important: use reform_param so previous LiDAR also gets a valid
+            # transformation_matrix into the current ego frame.
+            data[cav_id]['prev_params'] = self.reform_param(cav_content,
+                                                            ego_cav_content,
+                                                            timestamp_key,
+                                                            prev_timestamp_key,
+                                                            cur_ego_pose_flag)
+            # if data[cav_id]['ego'] and idx < 3:
+            #     print("DEBUG ego cur timestamp:", data[cav_id]['cur_timestamp'])
+            #     print("DEBUG ego prev timestamp:", data[cav_id]['prev_timestamp'])
+            #     print("DEBUG ego cur lidar:", data[cav_id]['lidar_np'].shape)
+            #     print("DEBUG ego prev lidar:", data[cav_id]['prev_lidar_np'].shape)
+        
+        
         return data
 
     @staticmethod
@@ -467,6 +510,9 @@ class BaseDataset(Dataset):
 
         # we always use current timestamp's gt bbx to gain a fair evaluation
         delay_params['vehicles'] = cur_params['vehicles']
+        for obj_id, obj in delay_params['vehicles'].items():
+            if 'speed' not in obj:
+                obj['speed'] = 0.0
         delay_params['transformation_matrix'] = transformation_matrix
         delay_params['gt_transformation_matrix'] = \
             gt_transformation_matrix

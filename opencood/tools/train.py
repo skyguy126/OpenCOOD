@@ -60,6 +60,9 @@ def main():
                                 num_workers=8,
                                 collate_fn=opencood_train_dataset.collate_batch_train,
                                 drop_last=False)
+        print("DEBUG validation dataset length:", len(opencood_validate_dataset))
+        print("DEBUG validation dataloader length:", len(val_loader)) 
+    
     else:
         train_loader = DataLoader(opencood_train_dataset,
                                   batch_size=hypes['train_params']['batch_size'],
@@ -75,6 +78,10 @@ def main():
                                 shuffle=False,
                                 pin_memory=False,
                                 drop_last=True)
+
+        print("DEBUG validate_dir:", hypes['validate_dir'])
+        print("DEBUG validation dataset length:", len(opencood_validate_dataset))
+        print("DEBUG validation dataloader length:", len(val_loader))
 
     print('---------------Creating Model------------------')
     model = train_utils.create_model(hypes)
@@ -195,10 +202,19 @@ def main():
                     final_loss = criterion(ouput_dict,
                                            batch_data['ego']['label_dict'])
                     valid_ave_loss.append(final_loss.item())
-            valid_ave_loss = statistics.mean(valid_ave_loss)
-            print('At epoch %d, the validation loss is %f' % (epoch,
-                                                              valid_ave_loss))
-            writer.add_scalar('Validate_Loss', valid_ave_loss, epoch)
+            # valid_ave_loss = statistics.mean(valid_ave_loss)
+            # print('At epoch %d, the validation loss is %f' % (epoch,
+            #                                                   valid_ave_loss))
+
+            if len(valid_ave_loss) > 0:
+                valid_ave_loss = statistics.mean(valid_ave_loss)
+                print('At epoch %d, the validation loss is %f' % (epoch, valid_ave_loss))
+            else:
+                print('At epoch %d, validation skipped: no validation batches.' % epoch)
+                valid_ave_loss = None
+            
+            if valid_ave_loss is not None:
+                writer.add_scalar('Validate_Loss', valid_ave_loss, epoch)
 
     print('Training Finished, checkpoints saved to %s' % saved_path)
 

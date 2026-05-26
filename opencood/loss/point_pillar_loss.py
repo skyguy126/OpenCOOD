@@ -76,6 +76,8 @@ class PointPillarLoss(nn.Module):
         self.reg_loss_func = WeightedSmoothL1Loss()
         self.alpha = 0.25
         self.gamma = 2.0
+        self.box_code_size = args.get('box_code_size', 8)
+
 
         self.cls_weight = args['cls_weight']
         self.reg_coe = args['reg']
@@ -126,8 +128,8 @@ class PointPillarLoss(nn.Module):
 
         # regression
         rm = rm.permute(0, 2, 3, 1).contiguous()
-        rm = rm.view(rm.size(0), -1, 7)
-        targets = targets.view(targets.size(0), -1, 7)
+        rm = rm.view(rm.size(0), -1, self.box_code_size)
+        targets = targets.view(targets.size(0), -1, self.box_code_size)
         box_preds_sin, reg_targets_sin = self.add_sin_difference(rm,
                                                                  targets)
         loc_loss_src =\
