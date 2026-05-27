@@ -71,16 +71,19 @@ class WeightedSmoothL1Loss(nn.Module):
 
 
 class PointPillarLoss(nn.Module):
+    # [x, y, z, h, w, l, yaw] — standard anchor box regression
+    GEO_DIM = 7
+    SPEED_IDX = 7
+
     def __init__(self, args):
         super(PointPillarLoss, self).__init__()
         self.reg_loss_func = WeightedSmoothL1Loss()
         self.alpha = 0.25
         self.gamma = 2.0
         self.box_code_size = args.get('box_code_size', 8)
-
-
         self.cls_weight = args['cls_weight']
         self.reg_coe = args['reg']
+        self.speed_weight = args.get('speed_weight', 2.0)
         self.loss_dict = {}
 
     def forward(self, output_dict, target_dict):
@@ -126,24 +129,38 @@ class PointPillarLoss(nn.Module):
         cls_loss = cls_loss_src.sum() / psm.shape[0]
         conf_loss = cls_loss * self.cls_weight
 
-        # regression
+        # regression: geometry (7D) and speed (1D) are supervised separately
         rm = rm.permute(0, 2, 3, 1).contiguous()
         rm = rm.view(rm.size(0), -1, self.box_code_size)
         targets = targets.view(targets.size(0), -1, self.box_code_size)
-        box_preds_sin, reg_targets_sin = self.add_sin_difference(rm,
-                                                                 targets)
-        loc_loss_src =\
-            self.reg_loss_func(box_preds_sin,
-                               reg_targets_sin,
-                               weights=reg_weights)
-        reg_loss = loc_loss_src.sum() / rm.shape[0]
-        reg_loss *= self.reg_coe
+        batch_size = rm.shape[0]
 
-        total_loss = reg_loss + conf_loss
+        box_preds = rm[..., :self.GEO_DIM]
+        box_targets = targets[..., :self.GEO_DIM]
+        box_preds_sin, box_targets_sin = self.add_sin_difference(
+            box_preds, box_targets)
+        box_loss_src = self.reg_loss_func(
+            box_preds_sin, box_targets_sin, weights=reg_weights)
+        box_loss = box_loss_src.sum() / batch_size * self.reg_coe
 
-        self.loss_dict.update({'total_loss': total_loss,
-                               'reg_loss': reg_loss,
-                               'conf_loss': conf_loss})
+        speed_loss = rm.new_zeros(())
+        if self.box_code_size > self.SPEED_IDX:
+            speed_preds = rm[..., self.SPEED_IDX:self.box_code_size]
+            speed_targets = targets[..., self.SPEED_IDX:self.box_code_size]
+            speed_loss_src = self.reg_loss_func(
+                speed_preds, speed_targets, weights=reg_weights)
+            speed_loss = speed_loss_src.sum() / batch_size * self.speed_weight
+
+        reg_loss = box_loss + speed_loss
+        total_loss = conf_loss + reg_loss
+
+        self.loss_dict.update({
+            'total_loss': total_loss,
+            'conf_loss': conf_loss,
+            'box_loss': box_loss,
+            'speed_loss': speed_loss,
+            'reg_loss': reg_loss,
+        })
 
         return total_loss
 
@@ -230,21 +247,23 @@ class PointPillarLoss(nn.Module):
             Used to visualize on tensorboard
         """
         total_loss = self.loss_dict['total_loss']
-        reg_loss = self.loss_dict['reg_loss']
         conf_loss = self.loss_dict['conf_loss']
+        box_loss = self.loss_dict['box_loss']
+        speed_loss = self.loss_dict['speed_loss']
+        log_msg = (
+            "[epoch %d][%d/%d], || Loss: %.4f || Conf: %.4f"
+            " || Box: %.4f || Speed: %.4f"
+            % (epoch, batch_id + 1, batch_len,
+               total_loss.item(), conf_loss.item(),
+               box_loss.item(), speed_loss.item()))
         if pbar is None:
-            print("[epoch %d][%d/%d], || Loss: %.4f || Conf Loss: %.4f"
-                " || Loc Loss: %.4f" % (
-                    epoch, batch_id + 1, batch_len,
-                    total_loss.item(), conf_loss.item(), reg_loss.item()))
+            print(log_msg)
         else:
-            pbar.set_description("[epoch %d][%d/%d], || Loss: %.4f || Conf Loss: %.4f"
-                  " || Loc Loss: %.4f" % (
-                      epoch, batch_id + 1, batch_len,
-                      total_loss.item(), conf_loss.item(), reg_loss.item()))
+            pbar.set_description(log_msg)
 
-
-        writer.add_scalar('Regression_loss', reg_loss.item(),
-                          epoch*batch_len + batch_id)
-        writer.add_scalar('Confidence_loss', conf_loss.item(),
-                          epoch*batch_len + batch_id)
+        step = epoch * batch_len + batch_id
+        writer.add_scalar('Confidence_loss', conf_loss.item(), step)
+        writer.add_scalar('Box_regression_loss', box_loss.item(), step)
+        writer.add_scalar('Speed_regression_loss', speed_loss.item(), step)
+        writer.add_scalar('Regression_loss',
+                          self.loss_dict['reg_loss'].item(), step)
