@@ -8,7 +8,7 @@ validate_dir: "/home/project/validate/validate"
 yaml_parser: "load_point_pillar_params"
 train_params:
   batch_size: &batch_size 2
-  epoches: 15
+  epoches: 30
   eval_freq: 1
   save_freq: 1
 
