@@ -273,7 +273,6 @@ class BaseDataset(Dataset):
                 pcd_utils.pcd_to_np(cav_content[timestamp_key_delay]['lidar'])
 
             # ---------------------------------------------------------
-            # Temporal velocity-prediction addition:
             # Load previous timestep LiDAR + YAML.
             # ---------------------------------------------------------
             prev_timestamp_index = max(0, timestamp_index_delay - 1)
