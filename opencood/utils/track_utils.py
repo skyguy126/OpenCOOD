@@ -108,7 +108,7 @@ def greedy_iou_associate(iou, iou_thresh=0.3):
 
 class SimpleTracker:
     """
-    Assign persistent IDs across frames.
+    Assign persistent global IDs across frames within an episode.
 
     At each step:
       1. Predict active tracks to t+1 with predicted speed.

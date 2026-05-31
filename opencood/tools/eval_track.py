@@ -1,11 +1,11 @@
 """
-Assign persistent bbox IDs across frames using predicted speed + greedy IoU association.
+Global-ID tracking eval: assign persistent IDs to predicted boxes and verify
+they follow the correct GT vehicle (by object_id) using GT t+1 positions.
 """
 import argparse
 import os
 import sys
 
-# Prefer this repo over a pip-installed OpenCOOD copy (e.g. /media/Disk2/OpenCOOD).
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
@@ -19,7 +19,9 @@ import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.tools import train_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.utils import box_utils
-from opencood.utils.track_utils import SimpleTracker, compute_dt, standup_iou_matrix, greedy_iou_associate
+from opencood.utils.track_utils import (
+    SimpleTracker, compute_dt, standup_iou_matrix, greedy_iou_associate,
+)
 
 
 def decode_pred_boxes_8d(post_processor, ego_data, output_dict, score_threshold=None):
@@ -35,7 +37,6 @@ def decode_pred_boxes_8d(post_processor, ego_data, output_dict, score_threshold=
     mask_reg = mask.unsqueeze(2).repeat(1, 1, box_code_size)
     boxes8d = torch.masked_select(batch_box3d[0], mask_reg[0]).view(-1, box_code_size)
     scores = torch.masked_select(prob[0], mask[0])
-
     if boxes8d.shape[0] == 0:
         return None, None
     return boxes8d, scores
@@ -44,7 +45,6 @@ def decode_pred_boxes_8d(post_processor, ego_data, output_dict, score_threshold=
 def apply_nms_to_8d_boxes(post_processor, boxes8d, scores):
     if boxes8d is None or boxes8d.shape[0] == 0:
         return None, None
-
     corners = box_utils.boxes_to_corners_3d(
         boxes8d[:, :7], order=post_processor.params["order"]
     )
@@ -55,18 +55,15 @@ def apply_nms_to_8d_boxes(post_processor, boxes8d, scores):
 
 
 def get_sample_info(dataset, idx):
-    """Map dataloader index to scenario/timestamp (same logic as BaseDataset)."""
     scenario_index = 0
     for i, end_idx in enumerate(dataset.len_record):
         if idx < end_idx:
             scenario_index = i
             break
-
     scenario_database = dataset.scenario_database[scenario_index]
     timestamp_index = idx if scenario_index == 0 else \
         idx - dataset.len_record[scenario_index - 1]
     timestamp = dataset.return_timestamp_key(scenario_database, timestamp_index)
-
     return {
         "dataset_idx": idx,
         "scenario_index": scenario_index,
@@ -75,18 +72,169 @@ def get_sample_info(dataset, idx):
     }
 
 
-def match_dets_to_gt(det_boxes8d, gt_boxes8d, post_processor, iou_thresh=0.3):
-    """Return list of (det_idx, gt_idx) using greedy IoU."""
-    if det_boxes8d is None or gt_boxes8d is None:
-        return []
-    if len(det_boxes8d) == 0 or len(gt_boxes8d) == 0:
+def to_numpy_boxes(boxes):
+    if boxes is None:
+        return None
+    if torch.is_tensor(boxes):
+        return boxes.detach().cpu().numpy()
+    return np.asarray(boxes)
+
+
+def greedy_match_with_iou(boxes_a8d, boxes_b8d, post_processor, iou_thresh):
+    """Return matches as list of (idx_a, idx_b, iou)."""
+    a = to_numpy_boxes(boxes_a8d)
+    b = to_numpy_boxes(boxes_b8d)
+    if a is None or b is None or len(a) == 0 or len(b) == 0:
         return []
 
-    det_np = det_boxes8d.detach().cpu().numpy() if torch.is_tensor(det_boxes8d) else det_boxes8d
-    gt_np = gt_boxes8d.detach().cpu().numpy() if torch.is_tensor(gt_boxes8d) else gt_boxes8d
-    iou = standup_iou_matrix(det_np, gt_np, post_processor)
-    matches, _, _ = greedy_iou_associate(iou, iou_thresh)
-    return matches
+    iou = standup_iou_matrix(a, b, post_processor)
+    pairs, _, _ = greedy_iou_associate(iou, iou_thresh)
+    return [(i, j, float(iou[i, j])) for i, j in pairs]
+
+
+def build_gt_global_map(object_ids, gt_boxes8d):
+    """GT global ID (vehicle object_id) -> (gt_idx, box8d)."""
+    gt_np = to_numpy_boxes(gt_boxes8d)
+    mapping = {}
+    for gt_idx, gid in enumerate(object_ids):
+        mapping[str(gid)] = (gt_idx, gt_np[gt_idx])
+    return mapping
+
+
+def build_pred_global_map(track_ids, det_boxes8d, gt_boxes8d, object_ids,
+                          post_processor, iou_thresh):
+    """
+    Pred global ID (tracker ID) -> {det_idx, box, gt_global_id or None, iou}.
+    """
+    pred_np = to_numpy_boxes(det_boxes8d)
+    matches = greedy_match_with_iou(det_boxes8d, gt_boxes8d, post_processor, iou_thresh)
+
+    det_to_gt = {}
+    det_to_iou = {}
+    for det_idx, gt_idx, iou_val in matches:
+        if gt_idx < len(object_ids):
+            det_to_gt[det_idx] = str(object_ids[gt_idx])
+            det_to_iou[det_idx] = iou_val
+
+    mapping = {}
+    for det_idx, gid in enumerate(track_ids):
+        mapping[int(gid)] = {
+            "det_idx": det_idx,
+            "box": pred_np[det_idx],
+            "gt_global_id": det_to_gt.get(det_idx),
+            "gt_iou": det_to_iou.get(det_idx, 0.0),
+        }
+    return mapping
+
+
+class TrackEvalStats:
+    def __init__(self):
+        self.frames = 0
+        self.frame_pairs = 0
+        self.total_dets = 0
+        self.max_global_id = 0
+        self.gt_links = 0
+        self.correct = 0
+        self.id_switch = 0
+        self.track_lost = 0
+        self.no_track_at_t = 0
+        self.misaligned = 0
+        self.center_dists = []
+        self.t1_ious = []
+        self.gt_to_pred_ids = {}
+        self.episode_fragmentation = []  # per GT vehicle: num pred IDs used
+        self._scenario_gt_map = {}
+
+    def start_scenario(self):
+        self._scenario_gt_map = {}
+
+    def end_scenario(self):
+        for gt_id, pred_ids in self._scenario_gt_map.items():
+            self.episode_fragmentation.append(len(pred_ids))
+
+    def record_pred_gt(self, gt_global_id, pred_global_id):
+        self._scenario_gt_map.setdefault(gt_global_id, set()).add(pred_global_id)
+
+    def eval_link(self, gt_global_id, gt_box_t1, pred_t, pred_t1,
+                  post_processor, iou_thresh):
+        self.gt_links += 1
+
+        pred_gid_t = None
+        for gid, info in pred_t.items():
+            if info["gt_global_id"] == gt_global_id:
+                pred_gid_t = gid
+                break
+
+        if pred_gid_t is None:
+            self.no_track_at_t += 1
+            return
+
+        self.record_pred_gt(gt_global_id, pred_gid_t)
+
+        if pred_gid_t not in pred_t1:
+            self.track_lost += 1
+            return
+
+        info_t1 = pred_t1[pred_gid_t]
+        if info_t1["gt_global_id"] != gt_global_id:
+            self.id_switch += 1
+            return
+
+        iou = standup_iou_matrix(
+            info_t1["box"].reshape(1, -1),
+            gt_box_t1.reshape(1, -1),
+            post_processor,
+        )[0, 0]
+
+        if iou < iou_thresh:
+            self.misaligned += 1
+            return
+
+        self.correct += 1
+        self.t1_ious.append(float(iou))
+        pred_xy = info_t1["box"][:2]
+        gt_xy = gt_box_t1[:2]
+        self.center_dists.append(float(np.linalg.norm(pred_xy - gt_xy)))
+
+    def report(self, track_iou_thresh, gt_iou_thresh):
+        print("\n========== GLOBAL ID TRACKING EVAL ==========")
+        print(f"Frames: {self.frames}  |  Frame pairs: {self.frame_pairs}")
+        print(f"Track-det IoU thresh: {track_iou_thresh}  |  GT IoU thresh: {gt_iou_thresh}")
+        print(f"Detections with global ID: {self.total_dets}  |  Max global ID: {self.max_global_id}")
+
+        print("\n--- GT t→t+1 links (same vehicle both frames) ---")
+        print(f"Total GT links: {self.gt_links}")
+
+        tracked_at_t = self.gt_links - self.no_track_at_t
+        print(f"No pred matched GT at t: {self.no_track_at_t}")
+        print(f"Pred tracked at t: {tracked_at_t}")
+
+        print("\n--- Global ID preservation (verified at GT t+1 position) ---")
+        print(f"Correct (ID kept + matched GT at t+1 + IoU ok): {self.correct}")
+        print(f"ID switch (wrong GT at t+1): {self.id_switch}")
+        print(f"Track lost (ID missing at t+1): {self.track_lost}")
+        print(f"Misaligned (right GT, IoU with GT t+1 box too low): {self.misaligned}")
+
+        if tracked_at_t > 0:
+            print(f"ID preservation rate (correct / tracked@t): {self.correct / tracked_at_t:.3f}")
+        if self.gt_links > 0:
+            print(f"GT link recall (correct / all GT links): {self.correct / self.gt_links:.3f}")
+        denom = self.correct + self.id_switch + self.misaligned
+        if denom > 0:
+            print(f"Identity accuracy (correct / resolved@t+1): {self.correct / denom:.3f}")
+
+        if self.center_dists:
+            d = np.array(self.center_dists)
+            print(f"\n--- Position at t+1 when ID correct ---")
+            print(f"Center dist (m): mean={d.mean():.2f}  median={np.median(d):.2f}  max={d.max():.2f}")
+        if self.t1_ious:
+            i = np.array(self.t1_ious)
+            print(f"IoU(pred, GT t+1): mean={i.mean():.3f}  median={np.median(i):.3f}")
+
+        if self.episode_fragmentation:
+            f = np.array(self.episode_fragmentation)
+            print(f"\n--- Episode fragmentation (pred global IDs per GT vehicle) ---")
+            print(f"Mean IDs/GT vehicle: {f.mean():.2f}  |  >1 ID: {(f > 1).sum()} / {len(f)}")
 
 
 def main():
@@ -96,9 +244,9 @@ def main():
     parser.add_argument("--max_batches", type=int, default=-1)
     parser.add_argument("--score_thresh", type=float, default=None)
     parser.add_argument("--iou_thresh", type=float, default=0.3,
-                        help="IoU threshold for track-det association")
+                        help="IoU for track-det association")
     parser.add_argument("--gt_iou_thresh", type=float, default=0.3,
-                        help="IoU threshold for det-GT matching in eval")
+                        help="IoU for det-GT matching and t+1 position verify")
     parser.add_argument("--num_workers", type=int, default=0)
     args = parser.parse_args()
 
@@ -107,13 +255,9 @@ def main():
     dataset = build_dataset(hypes, visualize=False, train=False)
 
     data_loader = DataLoader(
-        dataset,
-        batch_size=1,
-        num_workers=args.num_workers,
+        dataset, batch_size=1, num_workers=args.num_workers,
         collate_fn=dataset.collate_batch_test,
-        shuffle=False,
-        pin_memory=False,
-        drop_last=False,
+        shuffle=False, pin_memory=False, drop_last=False,
     )
 
     model = train_utils.create_model(hypes)
@@ -123,15 +267,12 @@ def main():
     post_processor = dataset.post_processor
 
     tracker = SimpleTracker(iou_thresh=args.iou_thresh)
-    prev_info = None
-    prev_track_ids = None
-    prev_det_to_gt = {}  # det_idx -> gt object_id string
+    stats = TrackEvalStats()
 
-    total_dets = 0
-    total_tracks = 0
-    id_switches = 0
-    consistent_links = 0
-    frames_processed = 0
+    prev_info = None
+    prev_gt_map = None
+    prev_pred_map = None
+    prev_scenario = None
 
     with torch.no_grad():
         for i, batch_data in enumerate(tqdm(data_loader)):
@@ -153,71 +294,66 @@ def main():
                     post_processor, pred_boxes8d, scores
                 )
 
-            if pred_boxes8d is None:
-                tracker.reset()
-                prev_info = info
-                prev_track_ids = None
-                prev_det_to_gt = {}
-                continue
-
-            pred_np = pred_boxes8d.detach().cpu().numpy()
-            score_np = scores.detach().cpu().numpy()
-
-            if prev_info is not None and info["scenario_index"] != prev_info["scenario_index"]:
-                tracker.reset()
-                prev_track_ids = None
-                prev_det_to_gt = {}
-            elif prev_info is not None:
-                tracker.set_dt(compute_dt(prev_info["timestamp"], info["timestamp"]))
-
-            track_ids = tracker.update(pred_np, score_np, post_processor)
-            total_dets += len(track_ids)
-            total_tracks = max(total_tracks, int(track_ids.max()) if len(track_ids) else 0)
-            frames_processed += 1
-
             gt_boxes = batch_data["ego"]["object_bbx_center"][0]
             gt_mask = batch_data["ego"]["object_bbx_mask"][0].bool()
             gt_boxes8d = gt_boxes[gt_mask]
             object_ids = batch_data["ego"].get("object_ids", [])
+            gt_map = build_gt_global_map(object_ids, gt_boxes8d)
 
-            det_to_gt = {}
-            for det_idx, gt_idx in match_dets_to_gt(
-                pred_boxes8d, gt_boxes8d, post_processor, args.gt_iou_thresh
-            ):
-                if gt_idx < len(object_ids):
-                    det_to_gt[det_idx] = str(object_ids[gt_idx])
+            # Scenario boundary
+            if prev_scenario is not None and info["scenario_index"] != prev_scenario:
+                stats.end_scenario()
+                tracker.reset()
+                prev_gt_map = None
+                prev_pred_map = None
+            if prev_scenario != info["scenario_index"]:
+                stats.start_scenario()
+            prev_scenario = info["scenario_index"]
 
-            if prev_track_ids is not None and prev_info["scenario_index"] == info["scenario_index"]:
-                prev_tid_to_gt = {}
-                for det_idx, tid in enumerate(prev_track_ids):
-                    if det_idx in prev_det_to_gt:
-                        prev_tid_to_gt[int(tid)] = prev_det_to_gt[det_idx]
+            if pred_boxes8d is None:
+                prev_info = info
+                prev_gt_map = gt_map
+                prev_pred_map = None
+                continue
 
-                for det_idx, tid in enumerate(track_ids):
-                    gt_id = det_to_gt.get(det_idx)
-                    prev_gt_id = prev_tid_to_gt.get(int(tid))
-                    if gt_id is None or prev_gt_id is None:
-                        continue
-                    if gt_id == prev_gt_id:
-                        consistent_links += 1
-                    else:
-                        id_switches += 1
+            if prev_info is not None and info["scenario_index"] == prev_info["scenario_index"]:
+                tracker.set_dt(compute_dt(prev_info["timestamp"], info["timestamp"]))
+
+            pred_np = pred_boxes8d.detach().cpu().numpy()
+            score_np = scores.detach().cpu().numpy()
+            global_ids = tracker.update(pred_np, score_np, post_processor)
+
+            stats.frames += 1
+            stats.total_dets += len(global_ids)
+            if len(global_ids):
+                stats.max_global_id = max(stats.max_global_id, int(global_ids.max()))
+
+            pred_map = build_pred_global_map(
+                global_ids, pred_boxes8d, gt_boxes8d, object_ids,
+                post_processor, args.gt_iou_thresh,
+            )
+
+            # Evaluate t -> t+1 links within same scenario
+            if (prev_gt_map is not None and prev_pred_map is not None
+                    and prev_info is not None
+                    and info["scenario_index"] == prev_info["scenario_index"]):
+                stats.frame_pairs += 1
+                common_gt_ids = set(prev_gt_map.keys()) & set(gt_map.keys())
+                for gt_gid in common_gt_ids:
+                    _, gt_box_t1 = gt_map[gt_gid]
+                    stats.eval_link(
+                        gt_gid, gt_box_t1, prev_pred_map, pred_map,
+                        post_processor, args.gt_iou_thresh,
+                    )
 
             prev_info = info
-            prev_track_ids = track_ids
-            prev_det_to_gt = det_to_gt
+            prev_gt_map = gt_map
+            prev_pred_map = pred_map
 
-    print("\n========== BBOX ID TRACKING ==========")
-    print("Frames processed:", frames_processed)
-    print("Total detections with IDs:", total_dets)
-    print("Max track ID assigned:", total_tracks)
-    print("Track-det IoU threshold:", args.iou_thresh)
-    print("Det-GT IoU threshold:", args.gt_iou_thresh)
-    print("GT-consistent track links (t -> t+1):", consistent_links)
-    print("ID switches (same track, different GT object):", id_switches)
-    if consistent_links + id_switches > 0:
-        accuracy = consistent_links / (consistent_links + id_switches)
-        print("Track consistency:", f"{accuracy:.3f}")
+    if prev_scenario is not None:
+        stats.end_scenario()
+
+    stats.report(args.iou_thresh, args.gt_iou_thresh)
 
 
 if __name__ == "__main__":
