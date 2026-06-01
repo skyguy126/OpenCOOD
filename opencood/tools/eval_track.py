@@ -20,7 +20,7 @@ from opencood.tools import train_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.utils import box_utils
 from opencood.utils.track_utils import (
-    SimpleTracker, compute_dt, standup_iou_matrix, greedy_iou_associate,
+    KalmanHungarianTracker, compute_dt, standup_iou_matrix, greedy_iou_associate,
 )
 
 
@@ -200,6 +200,7 @@ class TrackEvalStats:
         print("\n========== GLOBAL ID TRACKING EVAL ==========")
         print(f"Frames: {self.frames}  |  Frame pairs: {self.frame_pairs}")
         print(f"Track-det IoU thresh: {track_iou_thresh}  |  GT IoU thresh: {gt_iou_thresh}")
+        print("Tracker: Kalman (CV) + Hungarian (IoU + velocity cost)")
         print(f"Detections with global ID: {self.total_dets}  |  Max global ID: {self.max_global_id}")
 
         print("\n--- GT t→t+1 links (same vehicle both frames) ---")
@@ -247,6 +248,10 @@ def main():
                         help="IoU for track-det association")
     parser.add_argument("--gt_iou_thresh", type=float, default=0.3,
                         help="IoU for det-GT matching and t+1 position verify")
+    parser.add_argument("--max_age", type=int, default=3,
+                        help="Frames to keep unmatched Kalman tracks")
+    parser.add_argument("--vel_weight", type=float, default=0.3,
+                        help="Velocity mismatch weight in Hungarian cost")
     parser.add_argument("--num_workers", type=int, default=0)
     args = parser.parse_args()
 
@@ -266,7 +271,11 @@ def main():
     _, model = train_utils.load_saved_model(args.model_dir, model)
     post_processor = dataset.post_processor
 
-    tracker = SimpleTracker(iou_thresh=args.iou_thresh)
+    tracker = KalmanHungarianTracker(
+        iou_thresh=args.iou_thresh,
+        max_age=args.max_age,
+        vel_weight=args.vel_weight,
+    )
     stats = TrackEvalStats()
 
     prev_info = None
