@@ -58,6 +58,16 @@ class SpVoxelPreprocessor(BasePreprocessor):
             )
 
     def preprocess(self, pcd_np):
+        expected = self.params['args']['num_point_features']
+        if pcd_np.shape[1] != expected:
+            raise ValueError(
+                "Point cloud has {} features per point but preprocess "
+                "num_point_features is {}. For dual-frame training, run from "
+                "OpenCOOD_vamsi_2 (separate t/t-1 inputs). If you still use "
+                "the stacked time-lag pipeline in OpenCOOD, set "
+                "num_point_features to 5 in the yaml.".format(
+                    pcd_np.shape[1], expected))
+
         data_dict = {}
         if self.spconv == 1:
             voxel_output = self.voxel_generator.generate(pcd_np)

@@ -2,9 +2,15 @@
 # Author: Runsheng Xu <rxx3386@ucla.edu>
 # License: TDG-Attribution-NonCommercial-NoDistrib
 
+import os
+import sys
+
+# Prefer this repo over another OpenCOOD copy on PYTHONPATH.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import argparse
-import os
 import statistics
 
 import torch
@@ -38,6 +44,19 @@ def main():
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
 
     multi_gpu_utils.init_distributed_mode(opt)
+
+    if hypes.get('model', {}).get('args', {}).get('dual_frame'):
+        import inspect
+        import opencood.data_utils.datasets.early_fusion_dataset as efd_mod
+        efd_path = inspect.getfile(efd_mod.EarlyFusionDataset)
+        print('dual_frame enabled; EarlyFusionDataset loaded from:', efd_path)
+        if 'projected_lidar_prev' not in inspect.getsource(
+                efd_mod.EarlyFusionDataset.get_item_single_car):
+            raise RuntimeError(
+                "dual_frame is enabled in the yaml but EarlyFusionDataset "
+                "does not provide separate prev/current lidar. Train from "
+                "OpenCOOD_vamsi_2, not the legacy OpenCOOD tree that stacks "
+                "frames with a time-lag channel.")
 
     print('-----------------Dataset Building------------------')
     opencood_train_dataset = build_dataset(hypes, visualize=False, train=True)

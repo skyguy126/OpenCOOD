@@ -42,20 +42,26 @@ class DataAugmentor(object):
         gt_boxes, gt_mask, points = data_dict['object_bbx_center'], \
                                     data_dict['object_bbx_mask'], \
                                     data_dict['lidar_np']
+        prev_points = data_dict.get('prev_lidar_np', None)
         gt_boxes_valid = gt_boxes[gt_mask == 1]
 
         for cur_axis in config['ALONG_AXIS_LIST']:
             assert cur_axis in ['x', 'y']
-            gt_boxes_valid, points = getattr(augment_utils,
-                                             'random_flip_along_%s' % cur_axis)(
-                gt_boxes_valid, points,
-            )
+            flip_fn = getattr(augment_utils,
+                              'random_flip_along_%s' % cur_axis)
+            if prev_points is not None:
+                gt_boxes_valid, points, prev_points = flip_fn(
+                    gt_boxes_valid, points, prev_points)
+            else:
+                gt_boxes_valid, points = flip_fn(gt_boxes_valid, points)
 
         gt_boxes[:gt_boxes_valid.shape[0], :] = gt_boxes_valid
 
         data_dict['object_bbx_center'] = gt_boxes
         data_dict['object_bbx_mask'] = gt_mask
         data_dict['lidar_np'] = points
+        if prev_points is not None:
+            data_dict['prev_lidar_np'] = prev_points
 
         return data_dict
 
@@ -70,15 +76,22 @@ class DataAugmentor(object):
         gt_boxes, gt_mask, points = data_dict['object_bbx_center'], \
                                     data_dict['object_bbx_mask'], \
                                     data_dict['lidar_np']
+        prev_points = data_dict.get('prev_lidar_np', None)
         gt_boxes_valid = gt_boxes[gt_mask == 1]
-        gt_boxes_valid, points = augment_utils.global_rotation(
-            gt_boxes_valid, points, rot_range=rot_range
-        )
+        if prev_points is not None:
+            gt_boxes_valid, points, prev_points = augment_utils.global_rotation(
+                gt_boxes_valid, points, rot_range=rot_range,
+                prev_points=prev_points)
+        else:
+            gt_boxes_valid, points = augment_utils.global_rotation(
+                gt_boxes_valid, points, rot_range=rot_range)
         gt_boxes[:gt_boxes_valid.shape[0], :] = gt_boxes_valid
 
         data_dict['object_bbx_center'] = gt_boxes
         data_dict['object_bbx_mask'] = gt_mask
         data_dict['lidar_np'] = points
+        if prev_points is not None:
+            data_dict['prev_lidar_np'] = prev_points
 
         return data_dict
 
@@ -89,16 +102,23 @@ class DataAugmentor(object):
         gt_boxes, gt_mask, points = data_dict['object_bbx_center'], \
                                     data_dict['object_bbx_mask'], \
                                     data_dict['lidar_np']
+        prev_points = data_dict.get('prev_lidar_np', None)
         gt_boxes_valid = gt_boxes[gt_mask == 1]
 
-        gt_boxes_valid, points = augment_utils.global_scaling(
-            gt_boxes_valid, points, config['WORLD_SCALE_RANGE']
-        )
+        if prev_points is not None:
+            gt_boxes_valid, points, prev_points = augment_utils.global_scaling(
+                gt_boxes_valid, points, config['WORLD_SCALE_RANGE'],
+                prev_points=prev_points)
+        else:
+            gt_boxes_valid, points = augment_utils.global_scaling(
+                gt_boxes_valid, points, config['WORLD_SCALE_RANGE'])
         gt_boxes[:gt_boxes_valid.shape[0], :] = gt_boxes_valid
 
         data_dict['object_bbx_center'] = gt_boxes
         data_dict['object_bbx_mask'] = gt_mask
         data_dict['lidar_np'] = points
+        if prev_points is not None:
+            data_dict['prev_lidar_np'] = prev_points
 
         return data_dict
 

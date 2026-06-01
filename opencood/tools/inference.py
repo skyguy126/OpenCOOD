@@ -2,9 +2,14 @@
 # Author: Runsheng Xu <rxx3386@ucla.edu>, Hao Xiang <haxiang@g.ucla.edu>, Yifan Lu <yifan_lu@sjtu.edu.cn>
 # License: TDG-Attribution-NonCommercial-NoDistrib
 
+import os
+import sys
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import argparse
-import os
 import time
 from tqdm import tqdm
 

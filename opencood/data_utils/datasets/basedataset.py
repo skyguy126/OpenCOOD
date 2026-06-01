@@ -594,6 +594,22 @@ class BaseDataset(Dataset):
 
         return lidar_np, object_bbx_center, object_bbx_mask
 
+    def augment_dual(self, lidar_np, prev_lidar_np,
+                     object_bbx_center, object_bbx_mask):
+        """
+        Apply identical augmentation to current and previous frame point clouds.
+        """
+        tmp_dict = {'lidar_np': lidar_np,
+                    'prev_lidar_np': prev_lidar_np,
+                    'object_bbx_center': object_bbx_center,
+                    'object_bbx_mask': object_bbx_mask}
+        if self.train:
+            for cur_augmentor in self.data_augmentor.data_augmentor_queue:
+                tmp_dict = cur_augmentor(data_dict=tmp_dict)
+
+        return (tmp_dict['lidar_np'], tmp_dict['prev_lidar_np'],
+                tmp_dict['object_bbx_center'], tmp_dict['object_bbx_mask'])
+
     def collate_batch_train(self, batch):
         """
         Customized collate function for pytorch dataloader during training
@@ -614,7 +630,9 @@ class BaseDataset(Dataset):
         object_bbx_center = []
         object_bbx_mask = []
         processed_lidar_list = []
+        processed_lidar_prev_list = []
         label_dict_list = []
+        use_dual_lidar = 'processed_lidar_prev' in batch[0]['ego']
 
         if self.visualize:
             origin_lidar = []
@@ -624,6 +642,9 @@ class BaseDataset(Dataset):
             object_bbx_center.append(ego_dict['object_bbx_center'])
             object_bbx_mask.append(ego_dict['object_bbx_mask'])
             processed_lidar_list.append(ego_dict['processed_lidar'])
+            if use_dual_lidar:
+                processed_lidar_prev_list.append(
+                    ego_dict['processed_lidar_prev'])
             label_dict_list.append(ego_dict['label_dict'])
 
             if self.visualize:
@@ -641,6 +662,11 @@ class BaseDataset(Dataset):
                                    'object_bbx_mask': object_bbx_mask,
                                    'processed_lidar': processed_lidar_torch_dict,
                                    'label_dict': label_torch_dict})
+        if use_dual_lidar:
+            processed_lidar_prev_torch_dict = \
+                self.pre_processor.collate_batch(processed_lidar_prev_list)
+            output_dict['ego'].update(
+                {'processed_lidar_prev': processed_lidar_prev_torch_dict})
         if self.visualize:
             origin_lidar = \
                 np.array(downsample_lidar_minimum(pcd_np_list=origin_lidar))

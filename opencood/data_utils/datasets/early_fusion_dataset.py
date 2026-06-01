@@ -71,6 +71,7 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         assert len(ego_lidar_pose) > 0
 
         projected_lidar_stack = []
+        projected_lidar_prev_stack = []
         object_stack = []
         object_id_stack = []
         # object_stack_8d_debug = []
@@ -94,6 +95,8 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             # already.
             projected_lidar_stack.append(
                 selected_cav_processed['projected_lidar'])
+            projected_lidar_prev_stack.append(
+                selected_cav_processed['projected_lidar_prev'])
             # object_stack.append(selected_cav_processed['object_bbx_center'])
             object_stack.append(selected_cav_processed['object_bbx_center'])
             # object_stack_8d_debug.append(selected_cav_processed['object_bbx_center_8d_debug'])
@@ -116,10 +119,8 @@ class EarlyFusionDataset(basedataset.BaseDataset):
 
         # convert list to numpy array, (N, 4)
         projected_lidar_stack = np.vstack(projected_lidar_stack)
+        projected_lidar_prev_stack = np.vstack(projected_lidar_prev_stack)
 
-        # data augmentation
-        # projected_lidar_stack, object_bbx_center, mask = \
-        #     self.augment(projected_lidar_stack, object_bbx_center, mask)
         # Data augmentation only supports 7D boxes:
         # [x, y, z, h, w, l, yaw]
         # Our new 8D box is:
@@ -128,21 +129,28 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             speed_col = object_bbx_center[:, 7:8].copy()
             object_bbx_center_7d = object_bbx_center[:, :7].copy()
 
-            projected_lidar_stack, object_bbx_center_7d, mask = \
-                self.augment(projected_lidar_stack, object_bbx_center_7d, mask)
+            projected_lidar_stack, projected_lidar_prev_stack, \
+                object_bbx_center_7d, mask = \
+                self.augment_dual(projected_lidar_stack,
+                                  projected_lidar_prev_stack,
+                                  object_bbx_center_7d, mask)
 
             object_bbx_center = np.concatenate(
                 [object_bbx_center_7d, speed_col],
                 axis=1
             )
         else:
-            projected_lidar_stack, object_bbx_center, mask = \
-                self.augment(projected_lidar_stack, object_bbx_center, mask)
+            projected_lidar_stack, projected_lidar_prev_stack, \
+                object_bbx_center, mask = \
+                self.augment_dual(projected_lidar_stack,
+                                  projected_lidar_prev_stack,
+                                  object_bbx_center, mask)
 
-        # we do lidar filtering in the stacked lidar
+        cav_lidar_range = self.params['preprocess']['cav_lidar_range']
         projected_lidar_stack = mask_points_by_range(projected_lidar_stack,
-                                                     self.params['preprocess'][
-                                                         'cav_lidar_range'])
+                                                     cav_lidar_range)
+        projected_lidar_prev_stack = mask_points_by_range(
+            projected_lidar_prev_stack, cav_lidar_range)
         # augmentation may remove some of the bbx out of range
         object_bbx_center_valid = object_bbx_center[mask == 1]
         # object_bbx_center_valid_7d = object_bbx_center_valid[:, :7]
@@ -183,8 +191,10 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         unique_indices = list(np.array(unique_indices)[range_mask])
         # object_stack_8d_debug = object_stack_8d_debug[range_mask]
 
-        # pre-process the lidar to voxel/bev/downsampled lidar
+        # pre-process current and previous frame lidar separately
         lidar_dict = self.pre_processor.preprocess(projected_lidar_stack)
+        lidar_prev_dict = self.pre_processor.preprocess(
+            projected_lidar_prev_stack)
 
         # generate the anchor boxes
         anchor_box = self.post_processor.generate_anchor_box()
@@ -203,6 +213,7 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             'object_ids': [object_id_stack[i] for i in unique_indices],
             'anchor_box': anchor_box,
             'processed_lidar': lidar_dict,
+            'processed_lidar_prev': lidar_prev_dict,
             'label_dict': label_dict})
 
         if self.visualize:
@@ -282,12 +293,10 @@ class EarlyFusionDataset(basedataset.BaseDataset):
                 transformation_matrix
             )
 
-        # Add time-lag feature: current frame = 0.0
-        cur_time_lag = np.zeros((lidar_np.shape[0], 1), dtype=np.float32)
-        lidar_np = np.concatenate([lidar_np, cur_time_lag], axis=1)
+        lidar_np = lidar_np.astype(np.float32)
 
         # -----------------------------
-        # Previous frame LiDAR
+        # Previous frame LiDAR (separate input)
         # -----------------------------
         prev_lidar_np = selected_cav_base['prev_lidar_np']
         prev_lidar_np = shuffle_points(prev_lidar_np)
@@ -301,33 +310,14 @@ class EarlyFusionDataset(basedataset.BaseDataset):
                 prev_lidar_np[:, :3],
                 prev_transformation_matrix
             )
+        prev_lidar_np = prev_lidar_np.astype(np.float32)
 
-        # Add time-lag feature: previous frame = -0.1
-        prev_time_lag = -0.1 * np.ones((prev_lidar_np.shape[0], 1), dtype=np.float32)
-        prev_lidar_np = np.concatenate([prev_lidar_np, prev_time_lag], axis=1)
-
-        # -----------------------------
-        # Stack previous + current
-        # -----------------------------
-        lidar_np = np.vstack([prev_lidar_np, lidar_np]).astype(np.float32)
-
-        # selected_cav_processed.update(
-        #     {'object_bbx_center': object_bbx_center[object_bbx_mask == 1],
-        #      'object_ids': object_ids,
-        #      'projected_lidar': lidar_np})
         selected_cav_processed.update({
             'object_bbx_center': valid_object_bbx_center,
             'object_ids': object_ids,
-            'projected_lidar': lidar_np
+            'projected_lidar': lidar_np,
+            'projected_lidar_prev': prev_lidar_np,
         })
-        # if selected_cav_base['ego']:
-        #     print("DEBUG cur timestamp:", selected_cav_base.get('cur_timestamp', None))
-        #     print("DEBUG prev timestamp:", selected_cav_base.get('prev_timestamp', None))
-        #     print("DEBUG temporal lidar shape:", lidar_np.shape)
-        #     print("DEBUG time_lag min/max:", lidar_np[:, 4].min(), lidar_np[:, 4].max())
-        #     print("DEBUG 8D box shape:", valid_object_bbx_center.shape)
-        #     if valid_object_bbx_center.shape[0] > 0:
-        #         print("DEBUG first 8D box:", valid_object_bbx_center[0])
 
         return selected_cav_processed
 
@@ -374,6 +364,9 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             processed_lidar_torch_dict = \
                 self.pre_processor.collate_batch(
                     [cav_content['processed_lidar']])
+            processed_lidar_prev_torch_dict = \
+                self.pre_processor.collate_batch(
+                    [cav_content['processed_lidar_prev']])
             # label dictionary
             label_torch_dict = \
                 self.post_processor.collate_batch([cav_content['label_dict']])
@@ -385,6 +378,8 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             output_dict[cav_id].update({'object_bbx_center': object_bbx_center,
                                         'object_bbx_mask': object_bbx_mask,
                                         'processed_lidar': processed_lidar_torch_dict,
+                                        'processed_lidar_prev':
+                                            processed_lidar_prev_torch_dict,
                                         'label_dict': label_torch_dict,
                                         'object_ids': object_ids,
                                         'transformation_matrix': transformation_matrix_torch})
