@@ -1,3 +1,60 @@
+## Project Overview
+
+> **Presentation:** [**OpenCOOD Project Presentation**](https://docs.google.com/presentation/d/1k3UAddXEshM6kh1HWpSsDaLzclgH3r79/edit)
+
+**Authors:** Vamsi Eyunni
+
+This repository is a course project built on [OpenCOOD](https://github.com/DerrickXuNu/OpenCOOD) and the [OPV2V](https://arxiv.org/abs/2109.07644) cooperative perception dataset. The starting question was straightforward: OpenCOOD detects *where* vehicles are — can we also predict *how fast* they are moving, and can we track the same vehicle across consecutive frames?
+
+What follows is how the project evolved to answer those questions.
+
+### Phase 1 — Extending detection to predict speed
+
+We began by forking OpenCOOD's early-fusion PointPillar pipeline and asking it to output 8D boxes — the standard 7D geometry plus a speed channel in km/h, pulled from OPV2V vehicle metadata in each scenario YAML.
+
+This touched nearly every layer of the stack: the dataset loader appends speed to GT boxes, the voxel post-processor generates 8D anchor targets (with `speed_norm` for stable training), the regression head grows by one channel, and the loss function splits geometry and speed into separate supervised terms. Once the plumbing worked, the immediate problem was evaluation — we had no reliable way to know if predicted speeds were any good.
+
+The first eval script (`eval_speed.py`) matched predictions to GT by nearest center distance. It was quick to write but broke down in dense scenes where the wrong vehicle was often the closest. That pushed us toward IoU-based matching (`eval_speed_iou.py`), which pairs each detection to the best-overlapping GT box before comparing speed. We also separated the speed loss from box regression and added YAML configs to sweep `speed_weight` (2.0, 4.0, 8.0) and find a coefficient that actually improved speed without hurting detection.
+
+### Phase 2 — Measuring speed properly
+
+IoU matching was better, but the eval still treated predictions as a flat list rather than asking the right question: *for each GT vehicle, did we detect it and get the speed right?* We rewrote evaluation around per-GT matching in `eval_gt_speed.py` — every GT box gets a best IoU match (or is marked missed), errors are aggregated per scenario, and results export to CSV for debugging. This became the canonical way to measure speed accuracy for the rest of the project.
+
+### Phase 3 — Tracking vehicles across frames
+
+Speed alone is a snapshot; tracking is what makes it useful over time. Detections arrive frame-by-frame with no identity, so we built a tracking stack in three iterations:
+
+**Greedy IoU association** — The first attempt (`eval_track.py`) matched detections between consecutive frames using greedy standup-IoU assignment, with a constant-velocity helper that propagated boxes forward using predicted speed and yaw. It worked for simple cases but had no concept of a persistent identity.
+
+**Global ID evaluation** — We extended the tracker to assign IDs that persist across an entire scenario (resetting at scenario boundaries). The key test: link a predicted ID to a GT `object_id` at frame *t*, then check at frame *t+1* — does the same ID still follow the same vehicle? This gave us concrete metrics: ID preservation rate, ID switches, track loss, and fragmentation (how many different IDs one GT vehicle accumulated).
+
+**Kalman filter + Hungarian assignment** — Greedy matching struggled when vehicles crossed paths or detections flickered. The final tracker (`KalmanHungarianTracker`) follows a SORT-style design: each track runs a constant-velocity Kalman filter on BEV position, initialized from the detection's predicted speed; tracks are predicted forward using real OPV2V timestamps; and the Hungarian algorithm assigns detections using a cost that blends IoU overlap with velocity agreement. Unmatched tracks survive a few frames to handle brief occlusions.
+
+### Phase 4 — Giving the model temporal context
+
+Single-frame LiDAR gives limited motion information. We restructured training around **dual-frame fusion**: each sample loads both the current and previous LiDAR scan, encodes them through separate PointPillar backbones, and fuses the BEV features with a conv layer before prediction. The dataset, augmentor, and training loop all needed changes to pass `processed_lidar_prev` alongside the current frame. Evaluation followed in `eval_gt_multiframes.py`, which handles the two-frame model inputs while using the same per-GT speed metrics.
+
+### Phase 5 — Visualizing the full pipeline
+
+With detection, speed, and tracking all working, the last piece was making results visible. `make_gif.py` runs the dual-frame model over full OPV2V sequences, applies the Kalman tracker to smooth and label detections, renders BEV frames, and assembles them into GIFs — useful both for the presentation and for spotting failure modes that numbers alone miss.
+
+### Where things stand
+
+The project extends cooperative 3D detection with **speed regression** (8D boxes, dual-frame PointPillar, tunable speed loss) and **multi-frame vehicle tracking** (Kalman + Hungarian global IDs). The main entry points:
+
+| Script | Role |
+|--------|------|
+| `opencood/tools/train.py` | Train the dual-frame 8D model |
+| `opencood/tools/eval_gt_speed.py` | Per-GT speed accuracy (single-frame) |
+| `opencood/tools/eval_gt_multiframes.py` | Per-GT speed accuracy (dual-frame) |
+| `opencood/tools/eval_track.py` | Global ID tracking metrics |
+| `opencood/tools/make_gif.py` | Tracked BEV visualization + GIF |
+| `opencood/utils/track_utils.py` | Kalman tracker and association utilities |
+
+See the [presentation](https://docs.google.com/presentation/d/1k3UAddXEshM6kh1HWpSsDaLzclgH3r79/edit) for results and demo visuals.
+
+---
+
 <div align="center">
   <img src="images/opencood.png" width="600"/>
   <div>&nbsp;</div>
