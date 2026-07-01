@@ -2,7 +2,7 @@
 
 > **Presentation:** [**OpenCOOD Project Presentation**](https://docs.google.com/presentation/d/1k3UAddXEshM6kh1HWpSsDaLzclgH3r79/edit)
 
-**Authors:** Vamsi Eyunni
+**Authors:** Vamsi Eyunni, Hee Jean Kwon, Raphael Pilleu, Maxence Marty-Trintignac, Theodore Van Gaver
 
 This repository is a course project built on [OpenCOOD](https://github.com/DerrickXuNu/OpenCOOD) and the [OPV2V](https://arxiv.org/abs/2109.07644) cooperative perception dataset. The starting question was straightforward: OpenCOOD detects *where* vehicles are — can we also predict *how fast* they are moving, and can we track the same vehicle across consecutive frames?
 
