@@ -10,6 +10,7 @@ import torch.nn as nn
 from opencood.models.sub_modules.pillar_vfe import PillarVFE
 from opencood.models.sub_modules.point_pillar_scatter import PointPillarScatter
 from opencood.models.sub_modules.base_bev_backbone import BaseBEVBackbone
+from opencood.models.sub_modules.simple_planning_head import SimplePlanningHead
 
 
 class PointPillar(nn.Module):
@@ -18,6 +19,8 @@ class PointPillar(nn.Module):
 
         self.dual_frame = args.get('dual_frame', False)
         bev_channels = 128 * 3
+        planning_args = args.get('planning_head', {})
+        self.use_planning_head = planning_args.get('enabled', True)
 
         # PIllar VFE
         self.pillar_vfe = PillarVFE(
@@ -47,6 +50,14 @@ class PointPillar(nn.Module):
             kernel_size=1
         )
 
+        if self.use_planning_head:
+            self.planning_head = SimplePlanningHead(
+                in_channels=bev_channels,
+                hidden_channels=planning_args.get('hidden_channels', 128),
+                mlp_hidden_dim=planning_args.get('mlp_hidden_dim', 256),
+                num_waypoints=planning_args.get('num_waypoints', 6),
+            )
+
     def encode_frame(self, processed_lidar):
         batch_dict = {'voxel_features': processed_lidar['voxel_features'],
                       'voxel_coords': processed_lidar['voxel_coords'],
@@ -72,5 +83,9 @@ class PointPillar(nn.Module):
 
         output_dict = {'psm': psm,
                        'rm': rm}
+
+        if self.use_planning_head:
+            output_dict['future_waypoints'] = self.planning_head(
+                spatial_features_2d)
 
         return output_dict
