@@ -179,15 +179,19 @@ def main():
             # as well
             if not opt.half:
                 ouput_dict = model(batch_data['ego'])
+                target_dict = batch_data['ego']['label_dict']
+                target_dict['future_waypoints'] = \
+                    batch_data['ego']['future_waypoints']
                 # first argument is always your output dictionary,
                 # second argument is always your label dictionary.
-                final_loss = criterion(ouput_dict,
-                                       batch_data['ego']['label_dict'])
+                final_loss = criterion(ouput_dict, target_dict)
             else:
                 with torch.cuda.amp.autocast():
                     ouput_dict = model(batch_data['ego'])
-                    final_loss = criterion(ouput_dict,
-                                           batch_data['ego']['label_dict'])
+                    target_dict = batch_data['ego']['label_dict']
+                    target_dict['future_waypoints'] = \
+                        batch_data['ego']['future_waypoints']
+                    final_loss = criterion(ouput_dict, target_dict)
 
 
             criterion.logging(epoch, i, len(train_loader), writer, pbar=pbar2)
@@ -217,9 +221,11 @@ def main():
 
                     batch_data = train_utils.to_device(batch_data, device)
                     ouput_dict = model(batch_data['ego'])
+                    target_dict = batch_data['ego']['label_dict']
+                    target_dict['future_waypoints'] = \
+                        batch_data['ego']['future_waypoints']
 
-                    final_loss = criterion(ouput_dict,
-                                           batch_data['ego']['label_dict'])
+                    final_loss = criterion(ouput_dict, target_dict)
                     valid_ave_loss.append(final_loss.item())
             # valid_ave_loss = statistics.mean(valid_ave_loss)
             # print('At epoch %d, the validation loss is %f' % (epoch,

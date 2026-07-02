@@ -17,6 +17,7 @@ from opencood.utils import box_utils
 from opencood.data_utils.post_processor import build_postprocessor
 from opencood.data_utils.datasets import basedataset
 from opencood.data_utils.pre_processor import build_preprocessor
+from opencood.hypes_yaml.yaml_utils import load_yaml
 from opencood.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
@@ -50,6 +51,43 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         self.pre_processor = build_preprocessor(params['preprocess'],
                                                 train)
         self.post_processor = build_postprocessor(params['postprocess'], train)
+        self.num_future_waypoints = \
+            params.get('model', {}).get('args', {}).get(
+                'planning_head', {}).get('num_waypoints', 6)
+
+    def get_future_ego_waypoints(self, idx, ego_id, current_ego_pose,
+                                 num_waypoints=6):
+        scenario_index = 0
+        for i, ele in enumerate(self.len_record):
+            if idx < ele:
+                scenario_index = i
+                break
+
+        scenario_database = self.scenario_database[scenario_index]
+        timestamp_index = idx if scenario_index == 0 else \
+            idx - self.len_record[scenario_index - 1]
+
+        ego_timestamps = [
+            timestamp for timestamp, timestamp_content
+            in scenario_database[ego_id].items()
+            if isinstance(timestamp_content, OrderedDict)
+        ]
+        last_timestamp_index = len(ego_timestamps) - 1
+
+        future_waypoints = []
+        for step in range(1, num_waypoints + 1):
+            future_timestamp_index = min(timestamp_index + step,
+                                         last_timestamp_index)
+            future_timestamp = ego_timestamps[future_timestamp_index]
+            future_yaml = scenario_database[ego_id][future_timestamp]['yaml']
+            future_pose = load_yaml(future_yaml)['lidar_pose']
+            # Use simple future xy displacement in the current ego frame.
+            future_waypoints.append([
+                future_pose[0] - current_ego_pose[0],
+                future_pose[1] - current_ego_pose[1]
+            ])
+
+        return np.asarray(future_waypoints, dtype=np.float32)
 
     def __getitem__(self, idx):
         base_data_dict = self.retrieve_base_data(idx)
@@ -69,6 +107,11 @@ class EarlyFusionDataset(basedataset.BaseDataset):
 
         assert ego_id != -1
         assert len(ego_lidar_pose) > 0
+        future_waypoints = self.get_future_ego_waypoints(
+            idx,
+            ego_id,
+            ego_lidar_pose,
+            self.num_future_waypoints)
 
         projected_lidar_stack = []
         projected_lidar_prev_stack = []
@@ -214,7 +257,8 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             'anchor_box': anchor_box,
             'processed_lidar': lidar_dict,
             'processed_lidar_prev': lidar_prev_dict,
-            'label_dict': label_dict})
+            'label_dict': label_dict,
+            'future_waypoints': future_waypoints})
 
         if self.visualize:
             processed_data_dict['ego'].update({'origin_lidar':

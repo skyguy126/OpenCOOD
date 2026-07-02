@@ -84,6 +84,8 @@ class PointPillarLoss(nn.Module):
         self.cls_weight = args['cls_weight']
         self.reg_coe = args['reg']
         self.speed_weight = args.get('speed_weight', 2.0)
+        self.planning_weight = args.get('planning_weight', 1.0)
+        self.waypoint_loss_func = nn.MSELoss()
         self.loss_dict = {}
 
     def forward(self, output_dict, target_dict):
@@ -152,7 +154,15 @@ class PointPillarLoss(nn.Module):
             speed_loss = speed_loss_src.sum() / batch_size * self.speed_weight
 
         reg_loss = box_loss + speed_loss
-        total_loss = conf_loss + reg_loss
+        waypoint_loss = rm.new_zeros(())
+        if 'future_waypoints' in output_dict and 'future_waypoints' in target_dict:
+            pred_waypoints = output_dict['future_waypoints']
+            gt_waypoints = target_dict['future_waypoints']
+            waypoint_loss = self.waypoint_loss_func(pred_waypoints,
+                                                    gt_waypoints)
+
+        total_loss = conf_loss + reg_loss + \
+            self.planning_weight * waypoint_loss
 
         self.loss_dict.update({
             'total_loss': total_loss,
@@ -160,6 +170,7 @@ class PointPillarLoss(nn.Module):
             'box_loss': box_loss,
             'speed_loss': speed_loss,
             'reg_loss': reg_loss,
+            'waypoint_loss': waypoint_loss,
         })
 
         return total_loss
@@ -250,12 +261,13 @@ class PointPillarLoss(nn.Module):
         conf_loss = self.loss_dict['conf_loss']
         box_loss = self.loss_dict['box_loss']
         speed_loss = self.loss_dict['speed_loss']
+        waypoint_loss = self.loss_dict['waypoint_loss']
         log_msg = (
             "[epoch %d][%d/%d], || Loss: %.4f || Conf: %.4f"
-            " || Box: %.4f || Speed: %.4f"
+            " || Box: %.4f || Speed: %.4f || Waypoint: %.4f"
             % (epoch, batch_id + 1, batch_len,
                total_loss.item(), conf_loss.item(),
-               box_loss.item(), speed_loss.item()))
+               box_loss.item(), speed_loss.item(), waypoint_loss.item()))
         if pbar is None:
             print(log_msg)
         else:
@@ -265,5 +277,6 @@ class PointPillarLoss(nn.Module):
         writer.add_scalar('Confidence_loss', conf_loss.item(), step)
         writer.add_scalar('Box_regression_loss', box_loss.item(), step)
         writer.add_scalar('Speed_regression_loss', speed_loss.item(), step)
+        writer.add_scalar('Waypoint_loss', waypoint_loss.item(), step)
         writer.add_scalar('Regression_loss',
                           self.loss_dict['reg_loss'].item(), step)

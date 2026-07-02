@@ -632,7 +632,9 @@ class BaseDataset(Dataset):
         processed_lidar_list = []
         processed_lidar_prev_list = []
         label_dict_list = []
+        future_waypoints_list = []
         use_dual_lidar = 'processed_lidar_prev' in batch[0]['ego']
+        has_future_waypoints = 'future_waypoints' in batch[0]['ego']
 
         if self.visualize:
             origin_lidar = []
@@ -646,6 +648,8 @@ class BaseDataset(Dataset):
                 processed_lidar_prev_list.append(
                     ego_dict['processed_lidar_prev'])
             label_dict_list.append(ego_dict['label_dict'])
+            if has_future_waypoints:
+                future_waypoints_list.append(ego_dict['future_waypoints'])
 
             if self.visualize:
                 origin_lidar.append(ego_dict['origin_lidar'])
@@ -662,6 +666,10 @@ class BaseDataset(Dataset):
                                    'object_bbx_mask': object_bbx_mask,
                                    'processed_lidar': processed_lidar_torch_dict,
                                    'label_dict': label_torch_dict})
+        if has_future_waypoints:
+            future_waypoints = \
+                torch.from_numpy(np.array(future_waypoints_list)).float()
+            output_dict['ego'].update({'future_waypoints': future_waypoints})
         if use_dual_lidar:
             processed_lidar_prev_torch_dict = \
                 self.pre_processor.collate_batch(processed_lidar_prev_list)
