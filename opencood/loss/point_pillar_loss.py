@@ -154,12 +154,10 @@ class PointPillarLoss(nn.Module):
             speed_loss = speed_loss_src.sum() / batch_size * self.speed_weight
 
         reg_loss = box_loss + speed_loss
-        waypoint_loss = rm.new_zeros(())
-        if 'future_waypoints' in output_dict and 'future_waypoints' in target_dict:
-            pred_waypoints = output_dict['future_waypoints']
-            gt_waypoints = target_dict['future_waypoints']
-            waypoint_loss = self.waypoint_loss_func(pred_waypoints,
-                                                    gt_waypoints)
+        waypoint_loss = self.waypoint_loss_func(
+            output_dict['future_waypoints'],
+            target_dict['future_waypoints']
+        )
 
         total_loss = conf_loss + reg_loss + \
             self.planning_weight * waypoint_loss

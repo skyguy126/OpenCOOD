@@ -86,6 +86,12 @@ model:
 
     anchor_num: *achor_num
 
+    planning_head:
+      enabled: true
+      hidden_channels: 128
+      mlp_hidden_dim: 256
+      num_waypoints: 6
+
 loss:
   core_method: point_pillar_loss
   args:
@@ -93,6 +99,7 @@ loss:
     reg: 2.0
     speed_weight: 2.0
     box_code_size: 8
+    planning_weight: 1.0
 
 optimizer:
   core_method: Adam
