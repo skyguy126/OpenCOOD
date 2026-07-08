@@ -415,6 +415,12 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             label_torch_dict = \
                 self.post_processor.collate_batch([cav_content['label_dict']])
 
+            # planning GT (only exists for the ego vehicle)
+            if 'future_waypoints' in cav_content:
+                future_waypoints = torch.from_numpy(
+                    np.array([cav_content['future_waypoints']])
+                ).float()
+
             # save the transformation matrix (4, 4) to ego vehicle
             transformation_matrix_torch = \
                 torch.from_numpy(np.identity(4)).float()
@@ -426,7 +432,9 @@ class EarlyFusionDataset(basedataset.BaseDataset):
                                             processed_lidar_prev_torch_dict,
                                         'label_dict': label_torch_dict,
                                         'object_ids': object_ids,
-                                        'transformation_matrix': transformation_matrix_torch})
+                                        'transformation_matrix': transformation_matrix_torch,
+                                        **({'future_waypoints': future_waypoints}
+                                           if 'future_waypoints' in cav_content else {})})
 
             if self.visualize:
                 origin_lidar = \
