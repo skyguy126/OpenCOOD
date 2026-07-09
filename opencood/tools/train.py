@@ -24,6 +24,9 @@ from opencood.tools import multi_gpu_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.tools import train_utils
 
+# Flip this flag to enable/disable the path-planning head during training.
+ENABLE_PLANNING_HEAD = False
+
 
 def train_parser():
     parser = argparse.ArgumentParser(description="synthetic data generation")
@@ -42,6 +45,17 @@ def train_parser():
 def main():
     opt = train_parser()
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
+
+    planning_head_cfg = hypes['model']['args'].setdefault('planning_head', {})
+    planning_head_cfg['enabled'] = ENABLE_PLANNING_HEAD
+    hypes['loss']['args']['enable_planning'] = ENABLE_PLANNING_HEAD
+
+    if ENABLE_PLANNING_HEAD:
+        print('Planning head enabled. Training objectives: detection (cls), '
+              'box regression (x,y,z,h,w,l,yaw), speed, future waypoints.')
+    else:
+        print('Planning head disabled. Training objectives: detection (cls), '
+              'box regression (x,y,z,h,w,l,yaw), speed.')
 
     multi_gpu_utils.init_distributed_mode(opt)
 
@@ -180,8 +194,9 @@ def main():
             if not opt.half:
                 ouput_dict = model(batch_data['ego'])
                 target_dict = batch_data['ego']['label_dict']
-                target_dict['future_waypoints'] = \
-                    batch_data['ego']['future_waypoints']
+                if ENABLE_PLANNING_HEAD:
+                    target_dict['future_waypoints'] = \
+                        batch_data['ego']['future_waypoints']
                 # first argument is always your output dictionary,
                 # second argument is always your label dictionary.
                 final_loss = criterion(ouput_dict, target_dict)
@@ -189,8 +204,9 @@ def main():
                 with torch.cuda.amp.autocast():
                     ouput_dict = model(batch_data['ego'])
                     target_dict = batch_data['ego']['label_dict']
-                    target_dict['future_waypoints'] = \
-                        batch_data['ego']['future_waypoints']
+                    if ENABLE_PLANNING_HEAD:
+                        target_dict['future_waypoints'] = \
+                            batch_data['ego']['future_waypoints']
                     final_loss = criterion(ouput_dict, target_dict)
 
 
@@ -222,8 +238,9 @@ def main():
                     batch_data = train_utils.to_device(batch_data, device)
                     ouput_dict = model(batch_data['ego'])
                     target_dict = batch_data['ego']['label_dict']
-                    target_dict['future_waypoints'] = \
-                        batch_data['ego']['future_waypoints']
+                    if ENABLE_PLANNING_HEAD:
+                        target_dict['future_waypoints'] = \
+                            batch_data['ego']['future_waypoints']
 
                     final_loss = criterion(ouput_dict, target_dict)
                     valid_ave_loss.append(final_loss.item())

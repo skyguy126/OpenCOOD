@@ -84,6 +84,7 @@ class PointPillarLoss(nn.Module):
         self.cls_weight = args['cls_weight']
         self.reg_coe = args['reg']
         self.speed_weight = args.get('speed_weight', 2.0)
+        self.enable_planning = args.get('enable_planning', True)
         self.planning_weight = args.get('planning_weight', 1.0)
         self.waypoint_loss_func = nn.MSELoss()
         self.loss_dict = {}
@@ -154,13 +155,16 @@ class PointPillarLoss(nn.Module):
             speed_loss = speed_loss_src.sum() / batch_size * self.speed_weight
 
         reg_loss = box_loss + speed_loss
-        waypoint_loss = self.waypoint_loss_func(
-            output_dict['future_waypoints'],
-            target_dict['future_waypoints']
-        )
-
-        total_loss = conf_loss + reg_loss + \
-            self.planning_weight * waypoint_loss
+        if self.enable_planning:
+            waypoint_loss = self.waypoint_loss_func(
+                output_dict['future_waypoints'],
+                target_dict['future_waypoints']
+            )
+            total_loss = conf_loss + reg_loss + \
+                self.planning_weight * waypoint_loss
+        else:
+            waypoint_loss = rm.new_zeros(())
+            total_loss = conf_loss + reg_loss
 
         self.loss_dict.update({
             'total_loss': total_loss,
