@@ -64,6 +64,65 @@ def load_saved_model(saved_path, model):
     return initial_epoch, model
 
 
+def load_pretrained_weights(model, checkpoint_path):
+    """
+    Load a checkpoint without resuming the training epoch counter.
+    Missing keys (e.g. a newly added planning head) are left randomly init.
+    """
+    assert os.path.exists(checkpoint_path), \
+        '{} not found'.format(checkpoint_path)
+    print('loading pretrained weights from %s' % checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+    if missing:
+        print('pretrained load missing keys (%d):' % len(missing))
+        for key in missing:
+            print('  - %s' % key)
+    if unexpected:
+        print('pretrained load unexpected keys (%d):' % len(unexpected))
+        for key in unexpected:
+            print('  - %s' % key)
+    del checkpoint
+    return model
+
+
+def freeze_backbone(model):
+    """
+    Freeze every parameter except the planning head.
+    """
+    trainable = []
+    frozen = []
+    for name, param in model.named_parameters():
+        if name.startswith('planning_head'):
+            param.requires_grad = True
+            trainable.append(name)
+        else:
+            param.requires_grad = False
+            frozen.append(name)
+
+    print('Frozen %d parameter tensors; training %d planning-head tensors.'
+          % (len(frozen), len(trainable)))
+    for name in trainable:
+        print('  trainable: %s' % name)
+    return model
+
+
+def configure_frozen_training(model, freeze_backbone):
+    """
+    Keep frozen backbone modules in eval mode while training the planning head.
+    """
+    model.train()
+    if not freeze_backbone:
+        return model
+
+    for name, child in model.named_children():
+        if name != 'planning_head':
+            child.eval()
+    if hasattr(model, 'planning_head'):
+        model.planning_head.train()
+    return model
+
+
 def setup_train(hypes):
     """
     Create folder for saved model based on current timestep and model name

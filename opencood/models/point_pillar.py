@@ -18,9 +18,10 @@ class PointPillar(nn.Module):
         super(PointPillar, self).__init__()
 
         self.dual_frame = args.get('dual_frame', False)
+        self.freeze_backbone = args.get('freeze_backbone', False)
         bev_channels = 128 * 3
         planning_args = args.get('planning_head', {})
-        self.use_planning_head = planning_args.get('enabled', True)
+        self.use_planning_head = planning_args.get('enabled', False)
 
         # PIllar VFE
         self.pillar_vfe = PillarVFE(
@@ -77,6 +78,9 @@ class PointPillar(nn.Module):
         else:
             spatial_features_2d = self.encode_frame(
                 data_dict['processed_lidar'])
+
+        if self.freeze_backbone and self.training:
+            spatial_features_2d = spatial_features_2d.detach()
 
         psm = self.cls_head(spatial_features_2d)
         rm = self.reg_head(spatial_features_2d)

@@ -24,7 +24,8 @@ from opencood.tools import multi_gpu_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.tools import train_utils
 
-# Flip this flag to enable/disable the path-planning head during training.
+# Default off for the original detection+speed training entrypoint.
+# Path-only training is enabled via point_pillar_early_fusion_x2_path.yaml.
 ENABLE_PLANNING_HEAD = False
 
 
@@ -33,7 +34,10 @@ def train_parser():
     parser.add_argument("--hypes_yaml", type=str, required=True,
                         help='data generation yaml file needed ')
     parser.add_argument('--model_dir', default='',
-                        help='Continued training path')
+                        help='Continued training path or output directory')
+    parser.add_argument('--pretrained_dir', default='',
+                        help='Directory with a pretrained detection checkpoint '
+                             'to load before path-head training')
     parser.add_argument("--half", action='store_true',
                         help="whether train with half precision.")
     parser.add_argument('--dist_url', default='env://',
@@ -44,15 +48,39 @@ def train_parser():
 
 def main():
     opt = train_parser()
-    hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
+    hypes = yaml_utils.load_yaml(opt.hypes_yaml, None)
+    train_params = hypes.get('train_params', {})
+    pretrained_dir = opt.pretrained_dir or train_params.get('pretrained_dir', '')
+
+    # Resume an existing run (uses model_dir/config.yaml).
+    if opt.model_dir and not pretrained_dir:
+        hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
+        train_params = hypes.get('train_params', {})
+
+    pretrained_dir = opt.pretrained_dir or train_params.get('pretrained_dir', '')
+    freeze_backbone = train_params.get('freeze_backbone', False)
 
     planning_head_cfg = hypes['model']['args'].setdefault('planning_head', {})
-    planning_head_cfg['enabled'] = ENABLE_PLANNING_HEAD
-    hypes['loss']['args']['enable_planning'] = ENABLE_PLANNING_HEAD
-
     if ENABLE_PLANNING_HEAD:
-        print('Planning head enabled. Training objectives: detection (cls), '
-              'box regression (x,y,z,h,w,l,yaw), speed, future waypoints.')
+        planning_head_cfg['enabled'] = True
+        hypes['loss']['args']['enable_planning'] = True
+    else:
+        planning_head_cfg['enabled'] = planning_head_cfg.get('enabled', False)
+        hypes['loss']['args']['enable_planning'] = planning_head_cfg['enabled']
+
+    hypes['model']['args']['freeze_backbone'] = freeze_backbone
+    planning_only = hypes['loss']['args'].get('planning_only', False)
+
+    if planning_head_cfg.get('enabled', False):
+        if freeze_backbone:
+            print('Planning head enabled with frozen backbone. '
+                  'Training objectives: future waypoints only.')
+        elif planning_only:
+            print('Planning head enabled. Training objectives: '
+                  'future waypoints only.')
+        else:
+            print('Planning head enabled. Training objectives: detection (cls), '
+                  'box regression (x,y,z,h,w,l,yaw), speed, future waypoints.')
     else:
         print('Planning head disabled. Training objectives: detection (cls), '
               'box regression (x,y,z,h,w,l,yaw), speed.')
@@ -120,16 +148,32 @@ def main():
     model = train_utils.create_model(hypes)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # if we want to train from last checkpoint.
-    if opt.model_dir:
+    init_epoch = 0
+    if pretrained_dir:
+        pretrained_epoch = train_params.get('pretrained_epoch', 15)
+        checkpoint_path = os.path.join(
+            pretrained_dir, 'net_epoch%d.pth' % pretrained_epoch)
+        model = train_utils.load_pretrained_weights(model, checkpoint_path)
+        if freeze_backbone:
+            model = train_utils.freeze_backbone(model)
+        if opt.model_dir:
+            if os.path.abspath(opt.model_dir) == os.path.abspath(pretrained_dir):
+                print('model_dir matches pretrained_dir; writing checkpoints '
+                      'to a new logs folder to avoid overwriting pretrained '
+                      'weights.')
+                saved_path = train_utils.setup_train(hypes)
+            else:
+                saved_path = opt.model_dir
+                if not os.path.exists(saved_path):
+                    os.makedirs(saved_path)
+                yaml_utils.save_yaml(hypes,
+                                     os.path.join(saved_path, 'config.yaml'))
+        else:
+            saved_path = train_utils.setup_train(hypes)
+    elif opt.model_dir:
         saved_path = opt.model_dir
-        init_epoch, model = train_utils.load_saved_model(saved_path,
-                                                         model)
-
+        init_epoch, model = train_utils.load_saved_model(saved_path, model)
     else:
-        init_epoch = 0
-        # if we train the model from scratch, we need to create a folder
-        # to save the model,
         saved_path = train_utils.setup_train(hypes)
 
     # we assume gpu is necessary
@@ -178,8 +222,8 @@ def main():
         pbar2 = tqdm.tqdm(total=len(train_loader), leave=True)
 
         for i, batch_data in enumerate(train_loader):
-            # the model will be evaluation mode during validation
-            model.train()
+            train_utils.configure_frozen_training(model_without_ddp,
+                                                  freeze_backbone)
             model.zero_grad()
             optimizer.zero_grad()
 
@@ -194,7 +238,7 @@ def main():
             if not opt.half:
                 ouput_dict = model(batch_data['ego'])
                 target_dict = batch_data['ego']['label_dict']
-                if ENABLE_PLANNING_HEAD:
+                if planning_head_cfg.get('enabled', False):
                     target_dict['future_waypoints'] = \
                         batch_data['ego']['future_waypoints']
                 # first argument is always your output dictionary,
@@ -204,7 +248,7 @@ def main():
                 with torch.cuda.amp.autocast():
                     ouput_dict = model(batch_data['ego'])
                     target_dict = batch_data['ego']['label_dict']
-                    if ENABLE_PLANNING_HEAD:
+                    if planning_head_cfg.get('enabled', False):
                         target_dict['future_waypoints'] = \
                             batch_data['ego']['future_waypoints']
                     final_loss = criterion(ouput_dict, target_dict)
@@ -233,12 +277,13 @@ def main():
 
             with torch.no_grad():
                 for i, batch_data in enumerate(val_loader):
-                    model.eval()
+                    train_utils.configure_frozen_training(
+                        model_without_ddp, freeze_backbone)
 
                     batch_data = train_utils.to_device(batch_data, device)
                     ouput_dict = model(batch_data['ego'])
                     target_dict = batch_data['ego']['label_dict']
-                    if ENABLE_PLANNING_HEAD:
+                    if planning_head_cfg.get('enabled', False):
                         target_dict['future_waypoints'] = \
                             batch_data['ego']['future_waypoints']
 
