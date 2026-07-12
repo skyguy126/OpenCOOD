@@ -8,9 +8,10 @@ validate_dir: "/home/project/validate/validate"
 yaml_parser: "load_point_pillar_params"
 train_params:
   batch_size: &batch_size 2
-  epoches: 30
+  epoches: 15
   eval_freq: 1
   save_freq: 1
+  freeze_backbone: true
 
 fusion:
   core_method: 'EarlyFusionDataset' # LateFusionDataset, EarlyFusionDataset, IntermediateFusionDataset supported
@@ -68,6 +69,7 @@ model:
     anchor_number: *achor_num
     box_code_size: 8
     dual_frame: true
+    freeze_backbone: true
     pillar_vfe:
       use_norm: true
       with_distance: false
@@ -99,7 +101,10 @@ loss:
     reg: 2.0
     speed_weight: 2.0
     box_code_size: 8
+    enable_planning: true
+    planning_only: true
     planning_weight: 1.0
+    waypoint_loss_weights: [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
 
 optimizer:
   core_method: Adam
