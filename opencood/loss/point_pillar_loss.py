@@ -87,9 +87,10 @@ class PointPillarLoss(nn.Module):
         self.enable_planning = args.get('enable_planning', False)
         self.planning_only = args.get('planning_only', False)
         self.planning_weight = args.get('planning_weight', 1.0)
+        self.planning_loss_type = args.get('planning_loss_type', 'l1')
         self.waypoint_loss_func = nn.MSELoss()
         self.waypoint_loss_weights = torch.tensor(
-            args.get('waypoint_loss_weights', [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]),
+            args.get('waypoint_loss_weights', [1.0] * 10),
             dtype=torch.float32
         )
         self.loss_dict = {}
@@ -161,10 +162,21 @@ class PointPillarLoss(nn.Module):
 
         reg_loss = box_loss + speed_loss
         if self.enable_planning:
-            diff = output_dict['future_waypoints'] - target_dict['future_waypoints']
-            per_wp_mse = (diff ** 2).mean(dim=-1)  # [B, 6]
-            weights = self.waypoint_loss_weights.to(per_wp_mse.device)
-            waypoint_loss = (per_wp_mse * weights.view(1, -1)).mean()
+            if self.planning_loss_type == 'l1':
+                waypoint_loss = F.l1_loss(
+                    output_dict['future_waypoints'],
+                    target_dict['future_waypoints'])
+            else:
+                # Optional MSE fallback (weighted per-waypoint ablation)
+                diff = (output_dict['future_waypoints'] -
+                        target_dict['future_waypoints'])
+                per_wp_mse = (diff ** 2).mean(dim=-1)
+                n_wp = per_wp_mse.shape[-1]
+                weights = self.waypoint_loss_weights.to(per_wp_mse.device)
+                if weights.numel() != n_wp:
+                    weights = torch.ones(
+                        n_wp, dtype=torch.float32, device=per_wp_mse.device)
+                waypoint_loss = (per_wp_mse * weights.view(1, -1)).mean()
             if self.planning_only:
                 total_loss = self.planning_weight * waypoint_loss
             else:

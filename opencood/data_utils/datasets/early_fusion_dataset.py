@@ -53,10 +53,10 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         self.post_processor = build_postprocessor(params['postprocess'], train)
         self.num_future_waypoints = \
             params.get('model', {}).get('args', {}).get(
-                'planning_head', {}).get('num_waypoints', 6)
+                'planning_head', {}).get('num_waypoints', 10)
 
     def get_future_ego_waypoints(self, idx, ego_id, current_ego_pose,
-                                 num_waypoints=6):
+                                 num_waypoints=10):
         scenario_index = 0
         for i, ele in enumerate(self.len_record):
             if idx < ele:

@@ -28,15 +28,15 @@ def tensor_shape_summary(x):
     return type(x).__name__
 
 
-def save_csv(rows, csv_path):
+def save_csv(rows, csv_path, num_waypoints):
     csv_dir = os.path.dirname(csv_path)
     if csv_dir:
         os.makedirs(csv_dir, exist_ok=True)
 
     fieldnames = ["dataset_idx", "ade", "fde"]
-    for i in range(6):
+    for i in range(num_waypoints):
         fieldnames.append(f"wp{i}_error")
-    for i in range(6):
+    for i in range(num_waypoints):
         fieldnames.extend(
             [
                 f"gt_wp{i}_x",
@@ -157,15 +157,16 @@ def main():
                 pred_np = pred_waypoints[0].detach().cpu().numpy()
                 gt_np = gt_waypoints[0].detach().cpu().numpy()
                 err_np = errors[0].detach().cpu().numpy()
+                num_waypoints = gt_np.shape[0]
 
                 row = {
                     "dataset_idx": int(dataset_idx),
                     "ade": float(err_np.mean()),
                     "fde": float(err_np[-1]),
                 }
-                for i in range(6):
+                for i in range(num_waypoints):
                     row[f"wp{i}_error"] = float(err_np[i])
-                for i in range(6):
+                for i in range(num_waypoints):
                     row[f"gt_wp{i}_x"] = float(gt_np[i, 0])
                     row[f"gt_wp{i}_y"] = float(gt_np[i, 1])
                     row[f"pred_wp{i}_x"] = float(pred_np[i, 0])
@@ -179,6 +180,7 @@ def main():
     ade_mean = float(np.mean(ade_values))
     fde_mean = float(np.mean(fde_values))
     per_wp_mean = np.mean(np.stack(per_timestep_errors, axis=0), axis=0)
+    num_waypoints = per_wp_mean.shape[0]
 
     print("========== PLANNING / WAYPOINT EVALUATION ==========")
     print(f"Evaluated batches: {evaluated_batches}")
@@ -195,7 +197,7 @@ def main():
     )
 
     if args.csv_path is not None:
-        save_csv(csv_rows, args.csv_path)
+        save_csv(csv_rows, args.csv_path, num_waypoints)
 
 
 if __name__ == "__main__":
