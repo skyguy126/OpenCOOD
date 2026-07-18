@@ -5,11 +5,11 @@
 """
 Dataset class for early fusion
 """
-import random
 import math
 from collections import OrderedDict
 
 import numpy as np
+import numpy.linalg as npl
 import torch
 
 import opencood.data_utils.datasets
@@ -21,7 +21,16 @@ from opencood.hypes_yaml.yaml_utils import load_yaml
 from opencood.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
-from opencood.utils.transformation_utils import x1_to_x2
+from opencood.utils.transformation_utils import x1_to_x2, x_to_world
+
+
+def world_xy_to_ego(xy, ego_pose):
+    """Transform a world-frame xy point into the ego lidar frame."""
+    Tw = x_to_world(ego_pose)
+    pt = npl.inv(Tw) @ np.array(
+        [xy[0], xy[1], ego_pose[2], 1.0], dtype=np.float64)
+    return np.asarray(pt[:2], dtype=np.float32)
+
 
 def get_speed_by_object_id(vehicles, obj_id): #TODO jk
     if obj_id in vehicles:
@@ -38,7 +47,7 @@ def get_speed_by_object_id(vehicles, obj_id): #TODO jk
     except Exception:
         pass
 
-    return 0.0 
+    return 0.0
 
 
 class EarlyFusionDataset(basedataset.BaseDataset):
@@ -51,12 +60,16 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         self.pre_processor = build_preprocessor(params['preprocess'],
                                                 train)
         self.post_processor = build_postprocessor(params['postprocess'], train)
-        self.num_future_waypoints = \
+        planning_args = params.get('model', {}).get('args', {}).get(
+            'planning_head', {})
+        self.planning_enabled = planning_args.get('enabled', False)
+        self.num_future_waypoints = planning_args.get('num_waypoints', 10)
+        self.input_frame = int(
             params.get('model', {}).get('args', {}).get(
-                'planning_head', {}).get('num_waypoints', 10)
+                'history_frames',
+                planning_args.get('input_frame', self.history_frames)))
 
-    def get_future_ego_waypoints(self, idx, ego_id, current_ego_pose,
-                                 num_waypoints=10):
+    def _scenario_timestamp_info(self, idx, ego_id):
         scenario_index = 0
         for i, ele in enumerate(self.len_record):
             if idx < ele:
@@ -72,6 +85,16 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             in scenario_database[ego_id].items()
             if isinstance(timestamp_content, OrderedDict)
         ]
+        return scenario_database, timestamp_index, ego_timestamps
+
+    def get_future_ego_waypoints(self, idx, ego_id, current_ego_pose,
+                                 num_waypoints=10):
+        """
+        Future ego xy positions in the *current ego frame* (rotation-aware).
+        Labels only — never fed to the planner as an input feature.
+        """
+        scenario_database, timestamp_index, ego_timestamps = \
+            self._scenario_timestamp_info(idx, ego_id)
         last_timestamp_index = len(ego_timestamps) - 1
 
         future_waypoints = []
@@ -81,13 +104,89 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             future_timestamp = ego_timestamps[future_timestamp_index]
             future_yaml = scenario_database[ego_id][future_timestamp]['yaml']
             future_pose = load_yaml(future_yaml)['lidar_pose']
-            # Use simple future xy displacement in the current ego frame.
-            future_waypoints.append([
-                future_pose[0] - current_ego_pose[0],
-                future_pose[1] - current_ego_pose[1]
-            ])
+            # Transform future ego origin into the current ego frame.
+            T = x1_to_x2(future_pose, current_ego_pose)
+            future_waypoints.append([T[0, 3], T[1, 3]])
 
         return np.asarray(future_waypoints, dtype=np.float32)
+
+    def get_planning_target(self, idx, ego_id, current_ego_pose):
+        """
+        V2Xverse-style navigation command target in the current ego frame.
+
+        Uses OPV2V `plan_trajectory` (route hint available at the current
+        timestamp). Falls back to a fixed forward command if missing.
+        Never uses future GT waypoints.
+        """
+        scenario_database, timestamp_index, ego_timestamps = \
+            self._scenario_timestamp_info(idx, ego_id)
+        cur_yaml = scenario_database[ego_id][
+            ego_timestamps[timestamp_index]]['yaml']
+        cur_params = load_yaml(cur_yaml)
+
+        plan_traj = cur_params.get('plan_trajectory', None)
+        if plan_traj is not None and len(plan_traj) > 0:
+            # Far command point, analogous to CARLA x_command/y_command.
+            cmd_xy = plan_traj[-1][:2]
+            target = world_xy_to_ego(cmd_xy, current_ego_pose)
+        else:
+            # History-only fallback: extrapolate along recent ego motion.
+            hist_idx = max(0, timestamp_index - (self.input_frame - 1))
+            past_yaml = scenario_database[ego_id][
+                ego_timestamps[hist_idx]]['yaml']
+            past_pose = load_yaml(past_yaml)['lidar_pose']
+            past_in_ego = world_xy_to_ego(past_pose[:2], current_ego_pose)
+            direction = -past_in_ego  # from past toward current origin
+            norm = float(np.linalg.norm(direction))
+            if norm < 1e-3:
+                direction = np.array([1.0, 0.0], dtype=np.float32)
+            else:
+                direction = (direction / norm).astype(np.float32)
+            target = direction * 20.0
+
+        # Clip to a V2Xverse-like local command window in ego frame
+        # (front-heavy; OpenCOOD x-forward / y-left).
+        target = np.clip(target, a_min=[-12.0, -12.0],
+                         a_max=[36.0, 12.0]).astype(np.float32)
+        target[np.isnan(target)] = 0.0
+        return target
+
+    def get_history_occupancy_meta(self, idx, ego_id, current_ego_pose):
+        """
+        Per-history-frame actor/ego positions in the current ego frame for
+        V2Xverse occupancy channels 0/1.
+        """
+        scenario_database, timestamp_index, ego_timestamps = \
+            self._scenario_timestamp_info(idx, ego_id)
+        max_num = self.params['postprocess']['max_num']
+        t_len = self.input_frame
+
+        history_actor_xy = np.zeros((t_len, max_num, 2), dtype=np.float32)
+        history_actor_mask = np.zeros((t_len, max_num), dtype=np.float32)
+        history_ego_xy = np.zeros((t_len, 2), dtype=np.float32)
+
+        for t, hist_offset in enumerate(range(t_len - 1, -1, -1)):
+            hist_index = max(0, timestamp_index - hist_offset)
+            hist_key = ego_timestamps[hist_index]
+            hist_yaml = scenario_database[ego_id][hist_key]['yaml']
+            hist_params = load_yaml(hist_yaml)
+            hist_pose = hist_params['lidar_pose']
+            history_ego_xy[t] = world_xy_to_ego(hist_pose[:2], current_ego_pose)
+
+            vehicles = hist_params.get('vehicles', {})
+            count = 0
+            for _, veh in vehicles.items():
+                if count >= max_num:
+                    break
+                loc = veh.get('location', None)
+                if loc is None:
+                    continue
+                history_actor_xy[t, count] = world_xy_to_ego(
+                    loc[:2], current_ego_pose)
+                history_actor_mask[t, count] = 1.0
+                count += 1
+
+        return history_actor_xy, history_actor_mask, history_ego_xy
 
     def __getitem__(self, idx):
         base_data_dict = self.retrieve_base_data(idx)
@@ -112,12 +211,17 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             ego_id,
             ego_lidar_pose,
             self.num_future_waypoints)
+        planning_target = self.get_planning_target(
+            idx, ego_id, ego_lidar_pose)
+        history_actor_xy, history_actor_mask, history_ego_xy = \
+            self.get_history_occupancy_meta(idx, ego_id, ego_lidar_pose)
 
         projected_lidar_stack = []
         projected_lidar_prev_stack = []
+        projected_lidar_history_stacks = [
+            [] for _ in range(self.input_frame)]
         object_stack = []
         object_id_stack = []
-        # object_stack_8d_debug = []
 
         # loop over all CAVs to process information
         for cav_id, selected_cav_base in base_data_dict.items():
@@ -134,15 +238,14 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             selected_cav_processed = self.get_item_single_car(
                 selected_cav_base,
                 ego_lidar_pose)
-            # all these lidar and object coordinates are projected to ego
-            # already.
             projected_lidar_stack.append(
                 selected_cav_processed['projected_lidar'])
             projected_lidar_prev_stack.append(
                 selected_cav_processed['projected_lidar_prev'])
-            # object_stack.append(selected_cav_processed['object_bbx_center'])
+            for t, hist_lidar in enumerate(
+                    selected_cav_processed['projected_lidar_history']):
+                projected_lidar_history_stacks[t].append(hist_lidar)
             object_stack.append(selected_cav_processed['object_bbx_center'])
-            # object_stack_8d_debug.append(selected_cav_processed['object_bbx_center_8d_debug'])
             object_id_stack += selected_cav_processed['object_ids']
 
         # exclude all repetitive objects
@@ -150,8 +253,6 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             [object_id_stack.index(x) for x in set(object_id_stack)]
         object_stack = np.vstack(object_stack)
         object_stack = object_stack[unique_indices]
-        # object_stack_8d_debug = np.vstack(object_stack_8d_debug)
-        # object_stack_8d_debug = object_stack_8d_debug[unique_indices]
 
         # make sure bounding boxes across all frames have the same number
         object_bbx_center = \
@@ -163,6 +264,11 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         # convert list to numpy array, (N, 4)
         projected_lidar_stack = np.vstack(projected_lidar_stack)
         projected_lidar_prev_stack = np.vstack(projected_lidar_prev_stack)
+        projected_lidar_history = [
+            np.vstack(stack) if len(stack) > 0 else
+            np.zeros((1, 4), dtype=np.float32)
+            for stack in projected_lidar_history_stacks
+        ]
 
         # Data augmentation only supports 7D boxes:
         # [x, y, z, h, w, l, yaw]
@@ -189,25 +295,23 @@ class EarlyFusionDataset(basedataset.BaseDataset):
                                   projected_lidar_prev_stack,
                                   object_bbx_center, mask)
 
+        # Keep history lidar consistent with current/prev when no augment
+        # is configured (planner baseline). If augment is enabled, history
+        # clouds are left unaugmented — prefer empty data_augment for planning.
+        if len(self.data_augmentor.data_augmentor_queue) == 0:
+            projected_lidar_history[-1] = projected_lidar_stack
+            if len(projected_lidar_history) >= 2:
+                projected_lidar_history[-2] = projected_lidar_prev_stack
+
         cav_lidar_range = self.params['preprocess']['cav_lidar_range']
         projected_lidar_stack = mask_points_by_range(projected_lidar_stack,
                                                      cav_lidar_range)
         projected_lidar_prev_stack = mask_points_by_range(
             projected_lidar_prev_stack, cav_lidar_range)
-        # augmentation may remove some of the bbx out of range
-        object_bbx_center_valid = object_bbx_center[mask == 1]
-        # object_bbx_center_valid_7d = object_bbx_center_valid[:, :7]
-
-        # object_bbx_center_valid, range_mask = \
-        #     box_utils.mask_boxes_outside_range_numpy(object_bbx_center_valid,
-        #                                              self.params['preprocess'][
-        #                                                  'cav_lidar_range'],
-        #                                              self.params['postprocess'][
-        #                                                  'order'],
-        #                                              return_mask=True
-        #                                              )
-        # object_bbx_center_valid = object_bbx_center_valid[range_mask]
-        # object_bbx_center_valid[:, :7] = object_bbx_center_valid_7d
+        projected_lidar_history = [
+            mask_points_by_range(pc, cav_lidar_range)
+            for pc in projected_lidar_history
+        ]
 
         object_bbx_center_valid = object_bbx_center[mask == 1]
 
@@ -232,12 +336,15 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             object_bbx_center_valid
         object_bbx_center[object_bbx_center_valid.shape[0]:] = 0
         unique_indices = list(np.array(unique_indices)[range_mask])
-        # object_stack_8d_debug = object_stack_8d_debug[range_mask]
 
-        # pre-process current and previous frame lidar separately
+        # pre-process current, previous, and full history lidars
         lidar_dict = self.pre_processor.preprocess(projected_lidar_stack)
         lidar_prev_dict = self.pre_processor.preprocess(
             projected_lidar_prev_stack)
+        lidar_history_dicts = [
+            self.pre_processor.preprocess(pc)
+            for pc in projected_lidar_history
+        ]
 
         # generate the anchor boxes
         anchor_box = self.post_processor.generate_anchor_box()
@@ -251,14 +358,18 @@ class EarlyFusionDataset(basedataset.BaseDataset):
 
         processed_data_dict['ego'].update(
             {'object_bbx_center': object_bbx_center,
-            # 'object_bbx_center_8d_debug': object_stack_8d_debug,
             'object_bbx_mask': mask,
             'object_ids': [object_id_stack[i] for i in unique_indices],
             'anchor_box': anchor_box,
             'processed_lidar': lidar_dict,
             'processed_lidar_prev': lidar_prev_dict,
+            'processed_lidar_history': lidar_history_dicts,
             'label_dict': label_dict,
-            'future_waypoints': future_waypoints})
+            'future_waypoints': future_waypoints,
+            'planning_target': planning_target,
+            'history_actor_xy': history_actor_xy,
+            'history_actor_mask': history_actor_mask,
+            'history_ego_xy': history_ego_xy})
 
         if self.visualize:
             processed_data_dict['ego'].update({'origin_lidar':
@@ -289,11 +400,6 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             x1_to_x2(selected_cav_base['params']['lidar_pose'],
                      ego_pose)
 
-        # retrieve objects under ego coordinates
-        # object_bbx_center, object_bbx_mask, object_ids = \
-        #     self.post_processor.generate_object_center([selected_cav_base],
-        #                                                ego_pose)
-
         object_bbx_center, object_bbx_mask, object_ids = \
             self.post_processor.generate_object_center([selected_cav_base], ego_pose)
 
@@ -303,7 +409,6 @@ class EarlyFusionDataset(basedataset.BaseDataset):
 
         speed_list = []
         for obj_id in object_ids:
-            #speed = self.get_speed_by_object_id(vehicles, obj_id)
             speed = get_speed_by_object_id(vehicles, obj_id) #TODO
             speed_list.append(speed)
 
@@ -314,15 +419,6 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             [valid_object_bbx_center, speed_array],
             axis=1
         )
-        # filter lidar
-        # lidar_np = selected_cav_base['lidar_np']
-        # lidar_np = shuffle_points(lidar_np)
-        # # remove points that hit itself
-        # lidar_np = mask_ego_points(lidar_np)
-        # # project the lidar to ego space
-        # lidar_np[:, :3] = \
-        #     box_utils.project_points_by_matrix_torch(lidar_np[:, :3],
-        #                                              transformation_matrix)
 
         # -----------------------------
         # Current frame LiDAR
@@ -356,11 +452,29 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             )
         prev_lidar_np = prev_lidar_np.astype(np.float32)
 
+        # -----------------------------
+        # Full chronological history (oldest -> current)
+        # -----------------------------
+        projected_lidar_history = []
+        history_lidar_list = selected_cav_base.get(
+            'history_lidar_list', [lidar_np])
+        history_params_list = selected_cav_base.get(
+            'history_params_list', [selected_cav_base['params']])
+        for hist_lidar, hist_params in zip(
+                history_lidar_list, history_params_list):
+            hist_pc = shuffle_points(hist_lidar.copy())
+            hist_pc = mask_ego_points(hist_pc)
+            hist_T = hist_params['transformation_matrix']
+            hist_pc[:, :3] = box_utils.project_points_by_matrix_torch(
+                hist_pc[:, :3], hist_T)
+            projected_lidar_history.append(hist_pc.astype(np.float32))
+
         selected_cav_processed.update({
             'object_bbx_center': valid_object_bbx_center,
             'object_ids': object_ids,
             'projected_lidar': lidar_np,
             'projected_lidar_prev': prev_lidar_np,
+            'projected_lidar_history': projected_lidar_history,
         })
 
         return selected_cav_processed
@@ -411,30 +525,52 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             processed_lidar_prev_torch_dict = \
                 self.pre_processor.collate_batch(
                     [cav_content['processed_lidar_prev']])
+            processed_lidar_history = None
+            if 'processed_lidar_history' in cav_content:
+                processed_lidar_history = [
+                    self.pre_processor.collate_batch([hist])
+                    for hist in cav_content['processed_lidar_history']
+                ]
             # label dictionary
             label_torch_dict = \
                 self.post_processor.collate_batch([cav_content['label_dict']])
 
             # planning GT (only exists for the ego vehicle)
+            planning_fields = {}
             if 'future_waypoints' in cav_content:
-                future_waypoints = torch.from_numpy(
+                planning_fields['future_waypoints'] = torch.from_numpy(
                     np.array([cav_content['future_waypoints']])
+                ).float()
+            if 'planning_target' in cav_content:
+                planning_fields['planning_target'] = torch.from_numpy(
+                    np.array([cav_content['planning_target']])
+                ).float()
+                planning_fields['history_actor_xy'] = torch.from_numpy(
+                    np.array([cav_content['history_actor_xy']])
+                ).float()
+                planning_fields['history_actor_mask'] = torch.from_numpy(
+                    np.array([cav_content['history_actor_mask']])
+                ).float()
+                planning_fields['history_ego_xy'] = torch.from_numpy(
+                    np.array([cav_content['history_ego_xy']])
                 ).float()
 
             # save the transformation matrix (4, 4) to ego vehicle
             transformation_matrix_torch = \
                 torch.from_numpy(np.identity(4)).float()
 
-            output_dict[cav_id].update({'object_bbx_center': object_bbx_center,
-                                        'object_bbx_mask': object_bbx_mask,
-                                        'processed_lidar': processed_lidar_torch_dict,
-                                        'processed_lidar_prev':
-                                            processed_lidar_prev_torch_dict,
-                                        'label_dict': label_torch_dict,
-                                        'object_ids': object_ids,
-                                        'transformation_matrix': transformation_matrix_torch,
-                                        **({'future_waypoints': future_waypoints}
-                                           if 'future_waypoints' in cav_content else {})})
+            output_dict[cav_id].update({
+                'object_bbx_center': object_bbx_center,
+                'object_bbx_mask': object_bbx_mask,
+                'processed_lidar': processed_lidar_torch_dict,
+                'processed_lidar_prev': processed_lidar_prev_torch_dict,
+                'label_dict': label_torch_dict,
+                'object_ids': object_ids,
+                'transformation_matrix': transformation_matrix_torch,
+                **planning_fields})
+            if processed_lidar_history is not None:
+                output_dict[cav_id]['processed_lidar_history'] = \
+                    processed_lidar_history
 
             if self.visualize:
                 origin_lidar = \

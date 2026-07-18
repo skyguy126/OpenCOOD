@@ -67,6 +67,19 @@ class BaseDataset(Dataset):
         self.data_augmentor = DataAugmentor(params['data_augment'],
                                             train)
 
+        # Chronological history length for planner BEV features (oldest -> current).
+        # Default 2 preserves the dual-frame detection path.
+        model_args = params.get('model', {}).get('args', {})
+        planning_args = model_args.get('planning_head', {})
+        if planning_args.get('enabled', False):
+            self.history_frames = int(
+                model_args.get(
+                    'history_frames',
+                    planning_args.get('input_frame', 5)))
+        else:
+            self.history_frames = int(model_args.get('history_frames', 2))
+        self.history_frames = max(1, self.history_frames)
+
         # if the training/testing include noisy setting
         if 'wild_setting' in params:
             self.seed = params['wild_setting']['seed']
@@ -273,35 +286,44 @@ class BaseDataset(Dataset):
                 pcd_utils.pcd_to_np(cav_content[timestamp_key_delay]['lidar'])
 
             # ---------------------------------------------------------
-            # Load previous timestep LiDAR + YAML.
+            # Load chronological history LiDAR + params (oldest -> current).
+            # History lids are projected into the *current* ego frame via
+            # reform_param, matching V2Xverse temporal warping intent.
             # ---------------------------------------------------------
-            prev_timestamp_index = max(0, timestamp_index_delay - 1)
-            prev_timestamp_key = self.return_timestamp_key(scenario_database,
-                                                        prev_timestamp_index)
+            history_lidar_list = []
+            history_params_list = []
+            history_timestamp_keys = []
+            for hist_offset in range(self.history_frames - 1, -1, -1):
+                hist_timestamp_index = max(
+                    0, timestamp_index_delay - hist_offset)
+                hist_timestamp_key = self.return_timestamp_key(
+                    scenario_database, hist_timestamp_index)
+                history_timestamp_keys.append(hist_timestamp_key)
+                history_lidar_list.append(
+                    pcd_utils.pcd_to_np(
+                        cav_content[hist_timestamp_key]['lidar']))
+                history_params_list.append(
+                    self.reform_param(cav_content,
+                                      ego_cav_content,
+                                      timestamp_key,
+                                      hist_timestamp_key,
+                                      cur_ego_pose_flag))
 
-            # Save timestamps for debugging.
+            data[cav_id]['history_lidar_list'] = history_lidar_list
+            data[cav_id]['history_params_list'] = history_params_list
+            data[cav_id]['history_timestamps'] = history_timestamp_keys
+
+            # Backward-compatible dual-frame aliases (current + previous).
+            prev_timestamp_index = max(0, timestamp_index_delay - 1)
+            prev_timestamp_key = self.return_timestamp_key(
+                scenario_database, prev_timestamp_index)
             data[cav_id]['cur_timestamp'] = timestamp_key_delay
             data[cav_id]['prev_timestamp'] = prev_timestamp_key
+            data[cav_id]['prev_lidar_np'] = history_lidar_list[-2] \
+                if len(history_lidar_list) >= 2 else history_lidar_list[-1]
+            data[cav_id]['prev_params'] = history_params_list[-2] \
+                if len(history_params_list) >= 2 else history_params_list[-1]
 
-            # Load previous lidar.
-            data[cav_id]['prev_lidar_np'] = \
-                pcd_utils.pcd_to_np(cav_content[prev_timestamp_key]['lidar'])
-
-            # Load previous params.
-            # Important: use reform_param so previous LiDAR also gets a valid
-            # transformation_matrix into the current ego frame.
-            data[cav_id]['prev_params'] = self.reform_param(cav_content,
-                                                            ego_cav_content,
-                                                            timestamp_key,
-                                                            prev_timestamp_key,
-                                                            cur_ego_pose_flag)
-            # if data[cav_id]['ego'] and idx < 3:
-            #     print("DEBUG ego cur timestamp:", data[cav_id]['cur_timestamp'])
-            #     print("DEBUG ego prev timestamp:", data[cav_id]['prev_timestamp'])
-            #     print("DEBUG ego cur lidar:", data[cav_id]['lidar_np'].shape)
-            #     print("DEBUG ego prev lidar:", data[cav_id]['prev_lidar_np'].shape)
-        
-        
         return data
 
     @staticmethod
@@ -633,11 +655,22 @@ class BaseDataset(Dataset):
         processed_lidar_prev_list = []
         label_dict_list = []
         future_waypoints_list = []
+        planning_target_list = []
+        history_actor_xy_list = []
+        history_actor_mask_list = []
+        history_ego_xy_list = []
         use_dual_lidar = 'processed_lidar_prev' in batch[0]['ego']
+        use_history_lidar = 'processed_lidar_history' in batch[0]['ego']
         has_future_waypoints = 'future_waypoints' in batch[0]['ego']
+        has_planning_target = 'planning_target' in batch[0]['ego']
 
         if self.visualize:
             origin_lidar = []
+
+        history_by_time = None
+        if use_history_lidar:
+            n_hist = len(batch[0]['ego']['processed_lidar_history'])
+            history_by_time = [[] for _ in range(n_hist)]
 
         for i in range(len(batch)):
             ego_dict = batch[i]['ego']
@@ -647,9 +680,19 @@ class BaseDataset(Dataset):
             if use_dual_lidar:
                 processed_lidar_prev_list.append(
                     ego_dict['processed_lidar_prev'])
+            if use_history_lidar:
+                for t, hist_lidar in enumerate(
+                        ego_dict['processed_lidar_history']):
+                    history_by_time[t].append(hist_lidar)
             label_dict_list.append(ego_dict['label_dict'])
             if has_future_waypoints:
                 future_waypoints_list.append(ego_dict['future_waypoints'])
+            if has_planning_target:
+                planning_target_list.append(ego_dict['planning_target'])
+                history_actor_xy_list.append(ego_dict['history_actor_xy'])
+                history_actor_mask_list.append(
+                    ego_dict['history_actor_mask'])
+                history_ego_xy_list.append(ego_dict['history_ego_xy'])
 
             if self.visualize:
                 origin_lidar.append(ego_dict['origin_lidar'])
@@ -670,11 +713,30 @@ class BaseDataset(Dataset):
             future_waypoints = \
                 torch.from_numpy(np.array(future_waypoints_list)).float()
             output_dict['ego'].update({'future_waypoints': future_waypoints})
+        if has_planning_target:
+            output_dict['ego'].update({
+                'planning_target':
+                    torch.from_numpy(np.array(planning_target_list)).float(),
+                'history_actor_xy':
+                    torch.from_numpy(np.array(history_actor_xy_list)).float(),
+                'history_actor_mask':
+                    torch.from_numpy(
+                        np.array(history_actor_mask_list)).float(),
+                'history_ego_xy':
+                    torch.from_numpy(np.array(history_ego_xy_list)).float(),
+            })
         if use_dual_lidar:
             processed_lidar_prev_torch_dict = \
                 self.pre_processor.collate_batch(processed_lidar_prev_list)
             output_dict['ego'].update(
                 {'processed_lidar_prev': processed_lidar_prev_torch_dict})
+        if use_history_lidar:
+            processed_lidar_history = [
+                self.pre_processor.collate_batch(history_by_time[t])
+                for t in range(len(history_by_time))
+            ]
+            output_dict['ego'].update(
+                {'processed_lidar_history': processed_lidar_history})
         if self.visualize:
             origin_lidar = \
                 np.array(downsample_lidar_minimum(pcd_np_list=origin_lidar))

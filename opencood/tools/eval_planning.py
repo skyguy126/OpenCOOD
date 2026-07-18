@@ -129,6 +129,20 @@ def main():
                     "the first batch."
                 )
 
+            # Leakage checks: target must exist and must not be the GT endpoint.
+            if "planning_target" not in ego:
+                raise KeyError(
+                    "planning_target missing from batch. Endpoint-derived "
+                    "targets are no longer allowed."
+                )
+            gt_end = ego["future_waypoints"][:, -1, :]
+            tgt = ego["planning_target"]
+            if torch.allclose(tgt, gt_end, atol=1e-4, rtol=0):
+                raise RuntimeError(
+                    "Endpoint leakage: planning_target equals "
+                    "future_waypoints[:, -1]."
+                )
+
             output_dict = model(batch_data["ego"])
             if "future_waypoints" not in output_dict:
                 raise KeyError(
@@ -136,20 +150,36 @@ def main():
                     f"Available output keys: {list(output_dict.keys())}."
                 )
 
+            # Model must not receive future waypoints as an input feature.
+            # They are labels only (present in batch for metric computation).
+            if "planning_target" in output_dict:
+                out_tgt = output_dict["planning_target"]
+                if torch.allclose(out_tgt, gt_end, atol=1e-4, rtol=0):
+                    raise RuntimeError(
+                        "Endpoint leakage in model output planning_target."
+                    )
+
             pred_waypoints = output_dict["future_waypoints"]
             gt_waypoints = batch_data["ego"]["future_waypoints"]
 
             if gt_shape is None:
                 gt_shape = tuple(gt_waypoints.shape)
                 pred_shape = tuple(pred_waypoints.shape)
+                print(
+                    "Leakage check passed: planning_target != GT endpoint. "
+                    f"target[0]={tgt[0].detach().cpu().tolist()}, "
+                    f"gt_end[0]={gt_end[0].detach().cpu().tolist()}"
+                )
 
+            # V2Xverse ADE_FDE: per-sample mean over waypoints, then mean FDE
+            # on the last waypoint. Aggregate across samples with np.mean.
             errors = torch.linalg.norm(pred_waypoints - gt_waypoints, dim=-1)
-            ade_batch = errors.mean().item()
-            fde_batch = errors[:, -1].mean().item()
+            ade_batch = errors.mean(dim=1)  # [B]
+            fde_batch = errors[:, -1]       # [B]
             per_timestep = errors.mean(dim=0).detach().cpu().numpy()
 
-            ade_values.append(ade_batch)
-            fde_values.append(fde_batch)
+            ade_values.extend(ade_batch.detach().cpu().tolist())
+            fde_values.extend(fde_batch.detach().cpu().tolist())
             per_timestep_errors.append(per_timestep)
             evaluated_batches += 1
 

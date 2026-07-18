@@ -88,19 +88,21 @@ def load_pretrained_weights(model, checkpoint_path):
 
 def freeze_backbone(model):
     """
-    Freeze every parameter except the planning head.
+    Freeze every parameter except the planning infrastructure
+    (planning_head + optional planning_feature_adapter).
     """
     trainable = []
     frozen = []
     for name, param in model.named_parameters():
-        if name.startswith('planning_head'):
+        if (name.startswith('planning_head') or
+                name.startswith('planning_feature_adapter')):
             param.requires_grad = True
             trainable.append(name)
         else:
             param.requires_grad = False
             frozen.append(name)
 
-    print('Frozen %d parameter tensors; training %d planning-head tensors.'
+    print('Frozen %d parameter tensors; training %d planning tensors.'
           % (len(frozen), len(trainable)))
     for name in trainable:
         print('  trainable: %s' % name)
@@ -109,17 +111,18 @@ def freeze_backbone(model):
 
 def configure_frozen_training(model, freeze_backbone):
     """
-    Keep frozen backbone modules in eval mode while training the planning head.
+    Keep frozen detection/velocity modules in eval mode so BatchNorm
+    statistics do not change, while training only planning infrastructure.
     """
     model.train()
     if not freeze_backbone:
         return model
 
     for name, child in model.named_children():
-        if name != 'planning_head':
+        if name in ('planning_head', 'planning_feature_adapter'):
+            child.train()
+        else:
             child.eval()
-    if hasattr(model, 'planning_head'):
-        model.planning_head.train()
     return model
 
 
@@ -270,14 +273,17 @@ def setup_lr_schedular(hypes, optimizer, n_iter_per_epoch):
     optimizer : torch.optimizer
     """
     lr_schedule_config = hypes['lr_scheduler']
+    method = lr_schedule_config['core_method']
+    # Allow yaml aliases that match torch class names.
+    method_normalized = method.lower().replace('_', '')
 
-    if lr_schedule_config['core_method'] == 'step':
+    if method_normalized == 'step':
         from torch.optim.lr_scheduler import StepLR
         step_size = lr_schedule_config['step_size']
         gamma = lr_schedule_config['gamma']
         scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
 
-    elif lr_schedule_config['core_method'] == 'multistep':
+    elif method_normalized == 'multistep':
         from torch.optim.lr_scheduler import MultiStepLR
         milestones = lr_schedule_config['step_size']
         gamma = lr_schedule_config['gamma']
@@ -285,13 +291,22 @@ def setup_lr_schedular(hypes, optimizer, n_iter_per_epoch):
                                 milestones=milestones,
                                 gamma=gamma)
 
-    elif lr_schedule_config['core_method'] == 'exponential':
+    elif method_normalized == 'exponential':
         print('ExponentialLR is chosen for lr scheduler')
         from torch.optim.lr_scheduler import ExponentialLR
         gamma = lr_schedule_config['gamma']
         scheduler = ExponentialLR(optimizer, gamma)
 
-    elif lr_schedule_config['core_method'] == 'cosineannealwarm':
+    elif method_normalized in ('cosineannealinglr', 'cosineannealing'):
+        print('CosineAnnealingLR is chosen for lr scheduler')
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        t_max = lr_schedule_config.get(
+            'T_max', hypes.get('train_params', {}).get('epoches', 50))
+        eta_min = float(lr_schedule_config.get('eta_min', 0.0))
+        scheduler = CosineAnnealingLR(
+            optimizer, T_max=t_max, eta_min=eta_min)
+
+    elif method_normalized == 'cosineannealwarm':
         print('cosine annealing is chosen for lr scheduler')
         from timm.scheduler.cosine_lr import CosineLRScheduler
 

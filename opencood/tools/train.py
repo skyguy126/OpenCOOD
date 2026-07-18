@@ -59,6 +59,7 @@ def main():
 
     pretrained_dir = opt.pretrained_dir or train_params.get('pretrained_dir', '')
     freeze_backbone = train_params.get('freeze_backbone', False)
+    gradient_clip_norm = train_params.get('gradient_clip_norm', None)
 
     planning_head_cfg = hypes['model']['args'].setdefault('planning_head', {})
     if ENABLE_PLANNING_HEAD:
@@ -207,11 +208,18 @@ def main():
     print('Training start')
     epoches = hypes['train_params']['epoches']
     # used to help schedule learning rate
+    scheduler_method = hypes['lr_scheduler']['core_method'].lower().replace(
+        '_', '')
+    # CosineAnnealingLR is stepped once per epoch *after* the epoch (V2Xverse).
+    # MultiStep/Step still use the historical OpenCOOD begin-of-epoch step.
+    step_scheduler_at_epoch_start = scheduler_method not in (
+        'cosineannealinglr', 'cosineannealing', 'cosineannealwarm')
 
     for epoch in range(init_epoch, max(epoches, init_epoch)):
-        if hypes['lr_scheduler']['core_method'] != 'cosineannealwarm':
-            scheduler.step(epoch)
-        if hypes['lr_scheduler']['core_method'] == 'cosineannealwarm':
+        if step_scheduler_at_epoch_start:
+            if scheduler_method != 'cosineannealwarm':
+                scheduler.step(epoch)
+        if scheduler_method == 'cosineannealwarm':
             scheduler.step_update(epoch * num_steps + 0)
         for param_group in optimizer.param_groups:
             print('learning rate %.7f' % param_group["lr"])
@@ -259,14 +267,29 @@ def main():
 
             if not opt.half:
                 final_loss.backward()
+                if gradient_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad,
+                               model_without_ddp.parameters()),
+                        gradient_clip_norm)
                 optimizer.step()
             else:
                 scaler.scale(final_loss).backward()
+                if gradient_clip_norm is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad,
+                               model_without_ddp.parameters()),
+                        gradient_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
 
-            if hypes['lr_scheduler']['core_method'] == 'cosineannealwarm':
+            if scheduler_method == 'cosineannealwarm':
                 scheduler.step_update(epoch * num_steps + i)
+
+        # V2Xverse CosineAnnealingLR: step once at end of epoch.
+        if scheduler_method in ('cosineannealinglr', 'cosineannealing'):
+            scheduler.step()
 
         if epoch % hypes['train_params']['save_freq'] == 0:
             torch.save(model_without_ddp.state_dict(),

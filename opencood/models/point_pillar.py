@@ -23,6 +23,8 @@ class PointPillar(nn.Module):
         bev_channels = 128 * 3
         planning_args = args.get('planning_head', {})
         self.use_planning_head = planning_args.get('enabled', False)
+        self.input_frame = int(planning_args.get(
+            'input_frame', args.get('history_frames', 5)))
 
         # PIllar VFE
         self.pillar_vfe = PillarVFE(
@@ -52,10 +54,20 @@ class PointPillar(nn.Module):
             kernel_size=1
         )
 
+        self.planning_feature_adapter = None
         if self.use_planning_head:
+            planner_in = planning_args.get('feature_dir', 128)
+            bev_in = planning_args.get('bev_channels', bev_channels)
+            # Planner-owned adapter: OpenCOOD BEV (384) -> V2Xverse feature_dir (128).
+            if bev_in != planner_in:
+                self.planning_feature_adapter = nn.Sequential(
+                    nn.Conv2d(bev_in, planner_in, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(planner_in, eps=1e-3, momentum=0.01),
+                    nn.ReLU(inplace=True),
+                )
             self.planning_head = V2XVersePlanningHead(
-                feature_dir=planning_args.get('feature_dir', bev_channels),
-                input_frame=planning_args.get('input_frame', 5),
+                feature_dir=planner_in,
+                input_frame=self.input_frame,
                 output_points=planning_args.get('num_waypoints', 10),
             )
 
@@ -71,62 +83,91 @@ class PointPillar(nn.Module):
 
     def build_v2xverse_occupancy(self, data_dict, h, w, device):
         """
-        Build V2Xverse-style occupancy [B, 5, 6, H, W] and target [B, 2]
-        from EarlyFusionDataset tensors.
-        """
-        object_bbx_center = data_dict['object_bbx_center']
-        object_bbx_mask = data_dict['object_bbx_mask']
-        future_waypoints = data_dict['future_waypoints']
+        Build V2Xverse-style occupancy [B, T, 6, H, W] and target [B, 2].
 
-        batch_size = object_bbx_center.shape[0]
+        Channel meanings (V2Xverse pnp_dataset / generate_planning_input):
+          0: other-actor occupancy (per history frame)
+          1: ego occupancy (past ego pose in current ego frame)
+          2: local navigation-command / target-point occupancy
+          3: metric x coordinate map
+          4: metric y coordinate map
+          5: drivable-area / road map (zeros on OPV2V; no birdview)
+
+        Target is `planning_target` (route command), never a future waypoint.
+        """
+        assert 'planning_target' in data_dict, (
+            "planning_target missing — refusing to derive target from "
+            "future_waypoints (endpoint leakage).")
+        target = data_dict['planning_target'].to(device=device, dtype=torch.float32)
+        if target.ndim == 1:
+            target = target.unsqueeze(0)
+
+        batch_size = target.shape[0]
+        t_len = self.input_frame
         x_min, y_min, _, x_max, y_max, _ = self.lidar_range
 
-        occupancy_single = torch.zeros(
-            batch_size, 6, h, w, device=device, dtype=torch.float32)
+        occupancy = torch.zeros(
+            batch_size, t_len, 6, h, w, device=device, dtype=torch.float32)
 
-        # channel 0: actor occupancy from object centers
-        centers = object_bbx_center[..., :2]  # [B, max_num, 2]
-        mask = object_bbx_mask.bool()
-        for b in range(batch_size):
-            valid = centers[b][mask[b]]
-            if valid.numel() == 0:
-                continue
-            x_idx = ((valid[:, 0] - x_min) / (x_max - x_min) * (w - 1)).long()
-            y_idx = ((valid[:, 1] - y_min) / (y_max - y_min) * (h - 1)).long()
+        history_actor_xy = data_dict.get('history_actor_xy', None)
+        history_actor_mask = data_dict.get('history_actor_mask', None)
+        history_ego_xy = data_dict.get('history_ego_xy', None)
+
+        def xy_to_idx(xy):
+            # xy: [..., 2] in ego meters -> (x_idx along W, y_idx along H)
+            x_idx = ((xy[..., 0] - x_min) / (x_max - x_min) * (w - 1)).long()
+            y_idx = ((xy[..., 1] - y_min) / (y_max - y_min) * (h - 1)).long()
             x_idx = torch.clamp(x_idx, 0, w - 1)
             y_idx = torch.clamp(y_idx, 0, h - 1)
-            occupancy_single[b, 0, y_idx, x_idx] = 1.0
+            return x_idx, y_idx
 
-        # channel 1: ego occupancy at ego origin (0, 0)
-        ego_x = int(round((0.0 - x_min) / (x_max - x_min) * (w - 1)))
-        ego_y = int(round((0.0 - y_min) / (y_max - y_min) * (h - 1)))
-        ego_x = max(0, min(w - 1, ego_x))
-        ego_y = max(0, min(h - 1, ego_y))
-        occupancy_single[:, 1, ego_y, ego_x] = 1.0
+        for t in range(t_len):
+            # channel 0: actors at history timestamp t
+            if history_actor_xy is not None and history_actor_mask is not None:
+                centers = history_actor_xy[:, t]  # [B, max_num, 2]
+                mask = history_actor_mask[:, t].bool()
+                for b in range(batch_size):
+                    valid = centers[b][mask[b]]
+                    if valid.numel() == 0:
+                        continue
+                    x_idx, y_idx = xy_to_idx(valid)
+                    occupancy[b, t, 0, y_idx, x_idx] = 1.0
+            else:
+                # Fallback: current-frame boxes only (still no future leakage).
+                centers = data_dict['object_bbx_center'][..., :2]
+                mask = data_dict['object_bbx_mask'].bool()
+                for b in range(batch_size):
+                    valid = centers[b][mask[b]]
+                    if valid.numel() == 0:
+                        continue
+                    x_idx, y_idx = xy_to_idx(valid)
+                    occupancy[b, t, 0, y_idx, x_idx] = 1.0
 
-        # target: final GT waypoint
-        target = future_waypoints[:, -1, :]  # [B, 2]
+            # channel 1: ego occupancy at past ego position in current frame
+            if history_ego_xy is not None:
+                ego_xy = history_ego_xy[:, t]  # [B, 2]
+            else:
+                ego_xy = torch.zeros(batch_size, 2, device=device)
+            ex, ey = xy_to_idx(ego_xy)
+            for b in range(batch_size):
+                occupancy[b, t, 1, ey[b], ex[b]] = 1.0
 
-        # channel 2: local command / target point occupancy
-        tx = ((target[:, 0] - x_min) / (x_max - x_min) * (w - 1)).long()
-        ty = ((target[:, 1] - y_min) / (y_max - y_min) * (h - 1)).long()
-        tx = torch.clamp(tx, 0, w - 1)
-        ty = torch.clamp(ty, 0, h - 1)
-        for b in range(batch_size):
-            occupancy_single[b, 2, ty[b], tx[b]] = 1.0
+            # channel 2: local command / target point (same across time)
+            tx, ty = xy_to_idx(target)
+            for b in range(batch_size):
+                occupancy[b, t, 2, ty[b], tx[b]] = 1.0
 
-        # channel 3/4: normalized x/y coordinate maps
-        xs = torch.linspace(0.0, 1.0, w, device=device).view(1, 1, 1, w)
-        ys = torch.linspace(0.0, 1.0, h, device=device).view(1, 1, h, 1)
-        occupancy_single[:, 3:4] = xs.expand(batch_size, 1, h, w)
-        occupancy_single[:, 4:5] = ys.expand(batch_size, 1, h, w)
+        # channels 3/4: metric coordinate maps (V2Xverse-style, not 0-1)
+        xs = torch.linspace(x_min, x_max, w, device=device).view(1, 1, 1, w)
+        ys = torch.linspace(y_min, y_max, h, device=device).view(1, 1, h, 1)
+        occupancy[:, :, 3:4] = xs.expand(batch_size, t_len, 1, h, w)
+        occupancy[:, :, 4:5] = ys.expand(batch_size, t_len, 1, h, w)
+        # channel 5: road/drivable map unavailable on OPV2V -> zeros
 
-        # channel 5: zero road-map placeholder (already zeros)
-
-        occupancy = occupancy_single.unsqueeze(1).repeat(1, 5, 1, 1, 1)
         return occupancy, target
 
     def forward(self, data_dict):
+        # Detection path: keep existing early-fusion dual-frame temporal fusion.
         if self.dual_frame:
             feat_cur = self.encode_frame(data_dict['processed_lidar'])
             feat_prev = self.encode_frame(data_dict['processed_lidar_prev'])
@@ -135,6 +176,7 @@ class PointPillar(nn.Module):
         else:
             spatial_features_2d = self.encode_frame(
                 data_dict['processed_lidar'])
+            feat_cur = spatial_features_2d
 
         if self.freeze_backbone and self.training:
             spatial_features_2d = spatial_features_2d.detach()
@@ -146,26 +188,47 @@ class PointPillar(nn.Module):
                        'rm': rm}
 
         if self.use_planning_head:
-            if self.dual_frame:
-                if self.freeze_backbone:
-                    feat_cur = feat_cur.detach()
-                    feat_prev = feat_prev.detach()
-                feature_seq = torch.stack(
-                    [feat_prev, feat_prev, feat_prev, feat_cur, feat_cur],
-                    dim=1)
+            # Encode five real chronological history frames (oldest -> current).
+            if 'processed_lidar_history' in data_dict:
+                hist_feats = []
+                for hist_lidar in data_dict['processed_lidar_history']:
+                    feat_t = self.encode_frame(hist_lidar)
+                    if self.freeze_backbone:
+                        feat_t = feat_t.detach()
+                    hist_feats.append(feat_t)
+                feature_seq = torch.stack(hist_feats, dim=1)  # [B, T, C, H, W]
+            elif self.dual_frame:
+                # Should not happen for the planning baseline; fail loudly.
+                raise RuntimeError(
+                    "processed_lidar_history missing while planning head is "
+                    "enabled. Refusing to pad/repeat dual-frame features into "
+                    "a fake 5-frame sequence.")
             else:
-                feature_seq = spatial_features_2d.unsqueeze(1).repeat(
-                    1, 5, 1, 1, 1)
+                raise RuntimeError(
+                    "processed_lidar_history required for V2Xverse planning.")
 
-            if self.freeze_backbone:
-                feature_seq = feature_seq.detach()
+            assert feature_seq.shape[1] == self.input_frame, (
+                "Expected %d history BEV frames, got %d"
+                % (self.input_frame, feature_seq.shape[1]))
+
+            # Planner-owned adapter (trainable) after frozen BEV features.
+            b, t, c, h, w = feature_seq.shape
+            feat_flat = feature_seq.view(b * t, c, h, w)
+            if self.planning_feature_adapter is not None:
+                feat_flat = self.planning_feature_adapter(feat_flat)
+            feature_seq = feat_flat.view(
+                b, t, feat_flat.shape[1], h, w)
 
             occupancy, target = self.build_v2xverse_occupancy(
-                data_dict,
-                spatial_features_2d.shape[-2],
-                spatial_features_2d.shape[-1],
-                spatial_features_2d.device,
-            )
+                data_dict, h, w, feature_seq.device)
+
+            # Leakage guards (training + eval): target must not be GT endpoint.
+            if 'future_waypoints' in data_dict:
+                gt_end = data_dict['future_waypoints'][:, -1, :].to(target.device)
+                if torch.allclose(target, gt_end, atol=1e-4, rtol=0):
+                    raise RuntimeError(
+                        "Endpoint leakage detected: planning_target equals "
+                        "future_waypoints[:, -1].")
 
             planner_out = self.planning_head({
                 "occupancy": occupancy,
@@ -173,5 +236,8 @@ class PointPillar(nn.Module):
                 "target": target,
             })
             output_dict["future_waypoints"] = planner_out["future_waypoints"]
+            output_dict["planning_target"] = target
+            output_dict["planning_occupancy"] = occupancy
+            output_dict["planning_feature_seq"] = feature_seq
 
         return output_dict

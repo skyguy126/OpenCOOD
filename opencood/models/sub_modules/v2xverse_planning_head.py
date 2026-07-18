@@ -141,7 +141,9 @@ class V2XVersePlanningHead(nn.Module):
         x_1 = x_1.view(
             batch, -1, x_1.size(1), x_1.size(2), x_1.size(3)
         ).contiguous()
+        # Temporal length: input_frame (5) -> 3 after conv3d_1
         x_1 = self.conv3d_1(x_1)
+        self._last_temporal_lens = [self.input_frame, int(x_1.size(1))]
         x_1 = x_1.view(
             -1, x_1.size(2), x_1.size(3), x_1.size(4)
         ).contiguous()
@@ -153,7 +155,9 @@ class V2XVersePlanningHead(nn.Module):
         x_2 = x_2.view(
             batch, -1, x_2.size(1), x_2.size(2), x_2.size(3)
         ).contiguous()
+        # Temporal length: 3 -> 1 after conv3d_2
         x_2 = self.conv3d_2(x_2)
+        self._last_temporal_lens.append(int(x_2.size(1)))
         x_2 = x_2.view(
             -1, x_2.size(2), x_2.size(3), x_2.size(4)
         ).contiguous()

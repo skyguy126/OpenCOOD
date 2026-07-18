@@ -12,6 +12,8 @@ train_params:
   eval_freq: 1
   save_freq: 1
   freeze_backbone: true
+  # Match V2Xverse model_decoration.clip_grad=10 (implemented as grad-norm clip).
+  gradient_clip_norm: 10
 
 fusion:
   core_method: 'EarlyFusionDataset' # LateFusionDataset, EarlyFusionDataset, IntermediateFusionDataset supported
@@ -30,15 +32,9 @@ preprocess:
   # lidar range for each individual cav.
   cav_lidar_range: &cav_lidar [-140.8, -40, -3, 140.8, 40, 1]
 
-data_augment:
-  - NAME: random_world_flip
-    ALONG_AXIS_LIST: [ 'x' ]
-
-  - NAME: random_world_rotation
-    WORLD_ROT_ANGLE: [ -0.78539816, 0.78539816 ]
-
-  - NAME: random_world_scaling
-    WORLD_SCALE_RANGE: [ 0.95, 1.05 ]
+# Disabled for planner-only training so waypoint/target labels stay
+# consistent with lidar (OpenCOOD world augment would otherwise desync them).
+data_augment: []
 
 # anchor box related
 postprocess:
@@ -69,6 +65,8 @@ model:
     anchor_number: *achor_num
     box_code_size: 8
     dual_frame: true
+    # Five chronological history frames for the V2Xverse planner (oldest -> current).
+    history_frames: 5
     freeze_backbone: true
     pillar_vfe:
       use_norm: true
@@ -91,7 +89,9 @@ model:
     planning_head:
       enabled: true
       type: v2xverse
-      feature_dir: 384
+      # OpenCOOD BEV is 384-D; planner-owned 1x1 adapter maps to V2Xverse's 128-D.
+      bev_channels: 384
+      feature_dir: 128
       input_frame: 5
       num_waypoints: 10
 
@@ -105,6 +105,7 @@ loss:
     enable_planning: true
     planning_only: true
     planning_weight: 1.0
+    # Unweighted mean L1 (user-required; V2Xverse upstream uses per-step weights).
     planning_loss_type: l1
 
 optimizer:
@@ -115,7 +116,7 @@ optimizer:
     weight_decay: 0.0005
 
 lr_scheduler:
-  core_method: multistep #step, multistep and Exponential support
-  gamma: 0.1
-  step_size: [10, 15]
+  core_method: CosineAnnealingLR
+  T_max: 50
+  eta_min: 1.0e-6
 
