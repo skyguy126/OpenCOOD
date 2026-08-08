@@ -172,8 +172,14 @@ def main():
         else:
             saved_path = train_utils.setup_train(hypes)
     elif opt.model_dir:
+        # Resume: load full checkpoint (backbone + planner). Detection/speed
+        # weights are already in net_epoch*.pth from the earlier pretrained
+        # init — do not pass --pretrained_dir or training restarts at epoch 0
+        # with a randomly initialized planner.
         saved_path = opt.model_dir
         init_epoch, model = train_utils.load_saved_model(saved_path, model)
+        if freeze_backbone:
+            model = train_utils.freeze_backbone(model)
     else:
         saved_path = train_utils.setup_train(hypes)
 
