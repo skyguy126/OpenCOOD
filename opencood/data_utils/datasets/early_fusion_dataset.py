@@ -92,6 +92,9 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         """
         Future ego xy positions in the *current ego frame* (rotation-aware).
         Labels only — never fed to the planner as an input feature.
+
+        Samples the next ``num_waypoints`` consecutive stored frames
+        (OPV2V: 0.2s apart).
         """
         scenario_database, timestamp_index, ego_timestamps = \
             self._scenario_timestamp_info(idx, ego_id)

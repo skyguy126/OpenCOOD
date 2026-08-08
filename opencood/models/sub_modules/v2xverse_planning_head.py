@@ -51,7 +51,8 @@ class MLP(nn.Module):
 class V2XVersePlanningHead(nn.Module):
     """
     V2Xverse WaypointPlanner_e2e adapted for OpenCOOD PointPillar BEV features.
-    Expects input_frame=5 and output_points=10 (Conv3D temporal kernels).
+    Expects input_frame=5 and output_points=10 (Conv3D temporal kernels;
+    decoder MLP outputs 20 = 10*2).
     """
 
     def __init__(self, feature_dir: int = 384, input_frame: int = 5,

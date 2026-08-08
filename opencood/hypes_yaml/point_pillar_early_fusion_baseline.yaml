@@ -93,6 +93,8 @@ model:
       bev_channels: 384
       feature_dir: 128
       input_frame: 5
+      # Predict 10 future ego xy waypoints. On OPV2V, labels use the next 10
+      # stored frames (0.2s apart), spanning ~2.0s.
       num_waypoints: 10
 
 loss:
