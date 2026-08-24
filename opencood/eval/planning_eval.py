@@ -41,6 +41,24 @@ from opencood.data_utils.datasets import build_dataset
 from opencood.tools import train_utils
 
 
+HELD_OUT_TEST_DIR = "/media/Disk2/data/OPV2V/opv2v_data_dumping/test"
+
+
+def tensor_shape_summary(x: Any) -> Any:
+    if torch.is_tensor(x):
+        return tuple(x.shape)
+    if hasattr(x, "shape"):
+        try:
+            return tuple(x.shape)
+        except Exception:
+            pass
+    if isinstance(x, dict):
+        return {k: tensor_shape_summary(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [tensor_shape_summary(v) for v in x]
+    return type(x).__name__
+
+
 def test_parser():
     parser = argparse.ArgumentParser(description="Planning-only ADE/FDE evaluation")
 
@@ -216,8 +234,10 @@ def main():
     opt = test_parser()
 
     hypes = yaml_utils.load_yaml(None, opt)
+    # Force held-out split for evaluation (paths assumed to exist).
+    hypes["validate_dir"] = HELD_OUT_TEST_DIR
 
-    print("Building dataset...")
+    print(f"Building held-out eval dataset from: {HELD_OUT_TEST_DIR}")
     dataset = build_dataset(hypes, visualize=True, train=False)
 
     data_loader = DataLoader(
@@ -250,6 +270,7 @@ def main():
     csv_rows = []
 
     printed_debug = False
+    printed_leakage_check = False
     skipped = 0
 
     max_iter = len(data_loader)
@@ -309,6 +330,30 @@ def main():
             else:
                 print("\nPred future_waypoints missing from output_dict")
 
+            if "planning_target" in batch_ego:
+                print(
+                    "\nGT planning_target shape:",
+                    tuple(batch_ego["planning_target"].shape),
+                )
+                print(
+                    "GT planning_target[0]:",
+                    batch_ego["planning_target"][0].detach().cpu(),
+                )
+            else:
+                print("\nGT planning_target missing from batch_ego")
+
+            if "planning_target" in output_dict:
+                print(
+                    "\nPred planning_target shape:",
+                    tuple(output_dict["planning_target"].shape),
+                )
+                print(
+                    "Pred planning_target[0]:",
+                    output_dict["planning_target"][0].detach().cpu(),
+                )
+            else:
+                print("\nPred planning_target missing from output_dict")
+
             printed_debug = True
 
         if "future_waypoints" not in batch_ego:
@@ -317,6 +362,14 @@ def main():
                 "batch_data['ego']['future_waypoints'] is missing. "
                 "You probably added future_waypoints to collate_batch_train "
                 "but not collate_batch_test."
+            )
+
+        if "planning_target" not in batch_ego:
+            skipped += 1
+            raise KeyError(
+                "batch_data['ego']['planning_target'] is missing. "
+                f"Available ego keys: {list(batch_ego.keys())}. "
+                "Rerun with --debug_shapes to inspect the first batch."
             )
 
         if "future_waypoints" not in output_dict:
@@ -328,6 +381,39 @@ def main():
 
         gt_wp = batch_ego["future_waypoints"]
         pred_wp = output_dict["future_waypoints"]
+        gt_end = gt_wp[:, -1, :]
+        target = batch_ego["planning_target"]
+
+        if torch.allclose(target, gt_end, atol=1e-4, rtol=0):
+            skipped += 1
+            raise RuntimeError(
+                "Endpoint leakage: planning_target equals "
+                "future_waypoints[:, -1]."
+            )
+
+        if "planning_target" in output_dict:
+            out_target = output_dict["planning_target"]
+            if torch.allclose(out_target, gt_end.to(out_target.device),
+                              atol=1e-4, rtol=0):
+                skipped += 1
+                raise RuntimeError(
+                    "Endpoint leakage in model output planning_target."
+                )
+
+        if not printed_leakage_check:
+            print(
+                "Leakage check passed: planning_target != GT endpoint. "
+                f"target[0]={target[0].detach().cpu().tolist()}, "
+                f"gt_end[0]={gt_end[0].detach().cpu().tolist()}"
+            )
+            print(
+                "Batch ego summary:",
+                tensor_shape_summary({
+                    "future_waypoints": batch_ego["future_waypoints"],
+                    "planning_target": batch_ego["planning_target"],
+                }),
+            )
+            printed_leakage_check = True
 
         metrics = compute_planning_metrics(
             pred_wp,
