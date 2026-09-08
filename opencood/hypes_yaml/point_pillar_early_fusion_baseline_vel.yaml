@@ -1,0 +1,129 @@
+name: point_pillar_early_fusion_vel_ablation
+# Experiment 2: same as Experiment 1 (frozen x2_multiframe backbone + V2XVerse
+# planner) but predicted velocity is wired into the planner occupancy.
+# root_dir: "opv2v_data_dumping/train"
+# validate_dir: "opv2v_data_dumping/validate"
+root_dir: "/media/Disk2/data/OPV2V/opv2v_data_dumping/train"
+# validate_dir: "/media/Disk2/data/OPV2V/opv2v_data_dumping/test"
+validate_dir: "/home/project/validate/validate"
+
+yaml_parser: "load_point_pillar_params"
+train_params:
+  batch_size: &batch_size 2
+  epoches: 50
+  eval_freq: 1
+  save_freq: 1
+  freeze_backbone: true
+  # Match V2Xverse model_decoration.clip_grad=10 (implemented as grad-norm clip).
+  gradient_clip_norm: 10
+
+fusion:
+  core_method: 'EarlyFusionDataset' # LateFusionDataset, EarlyFusionDataset, IntermediateFusionDataset supported
+  args: []
+
+# preprocess-related
+preprocess:
+  # options: BasePreprocessor, VoxelPreprocessor, BevPreprocessor
+  core_method: 'SpVoxelPreprocessor'
+  args:
+    voxel_size: &voxel_size [0.4, 0.4, 4]
+    max_points_per_voxel: 32
+    max_voxel_train: 32000
+    max_voxel_test: 70000
+    num_point_features: 4
+  # lidar range for each individual cav.
+  cav_lidar_range: &cav_lidar [-140.8, -40, -3, 140.8, 40, 1]
+
+# Disabled for planner-only training so waypoint/target labels stay
+# consistent with lidar (OpenCOOD world augment would otherwise desync them).
+data_augment: []
+
+# anchor box related
+postprocess:
+  core_method: 'VoxelPostprocessor' # VoxelPostprocessor, BevPostprocessor supported
+  anchor_args:
+    cav_lidar_range: *cav_lidar
+    l: 3.9
+    w: 1.6
+    h: 1.56
+    r: [0, 90]
+    num: &achor_num 2
+    box_code_size: 8
+  target_args:
+    pos_threshold: 0.6
+    neg_threshold: 0.45
+    score_threshold: 0.20
+    speed_norm: 30.0
+  order: 'hwl' # hwl or lwh
+  max_num: 100 # maximum number of objects in a single frame. use this number to make sure different frames has the same dimension in the same batch
+  nms_thresh: 0.15
+
+# model related
+model:
+  core_method: point_pillar
+  args:
+    voxel_size: *voxel_size
+    lidar_range: *cav_lidar
+    anchor_number: *achor_num
+    box_code_size: 8
+    dual_frame: true
+    # Five chronological history frames for the V2Xverse planner (oldest -> current).
+    history_frames: 5
+    freeze_backbone: true
+    pillar_vfe:
+      use_norm: true
+      with_distance: false
+      use_absolute_xyz: true
+      num_point_features: 4
+      num_filters: [64]
+    point_pillar_scatter:
+      num_features: 64
+
+    base_bev_backbone:
+      layer_nums: [3, 5, 8]
+      layer_strides: [2, 2, 2]
+      num_filters: [64, 128, 256]
+      upsample_strides: [1, 2, 4]
+      num_upsample_filter: [128, 128, 128]
+
+    anchor_num: *achor_num
+
+    planning_head:
+      enabled: true
+      type: v2xverse
+      # Ablation vs Experiment 1: feed frozen-backbone predicted speed into
+      # planner occupancy as channel 6 (occupancy_channels=7).
+      use_velocity_in_planning: true
+      # OpenCOOD BEV is 384-D; planner-owned 1x1 adapter maps to V2Xverse's 128-D.
+      bev_channels: 384
+      feature_dir: 128
+      input_frame: 5
+      # Predict 10 future ego xy waypoints. On OPV2V, labels use the next 10
+      # stored frames (0.2s apart), spanning ~2.0s.
+      num_waypoints: 10
+
+loss:
+  core_method: point_pillar_loss
+  args:
+    cls_weight: 1.0
+    reg: 2.0
+    speed_weight: 2.0
+    box_code_size: 8
+    enable_planning: true
+    planning_only: true
+    planning_weight: 1.0
+    # Unweighted mean L1 (user-required; V2Xverse upstream uses per-step weights).
+    planning_loss_type: l1
+
+optimizer:
+  core_method: AdamW
+  lr: 0.0001
+  args:
+    eps: 1.0e-8
+    weight_decay: 0.0005
+
+lr_scheduler:
+  core_method: CosineAnnealingLR
+  T_max: 50
+  eta_min: 1.0e-6
+

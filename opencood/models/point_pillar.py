@@ -5,6 +5,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 from opencood.models.sub_modules.pillar_vfe import PillarVFE
@@ -20,11 +21,17 @@ class PointPillar(nn.Module):
         self.dual_frame = args.get('dual_frame', False)
         self.freeze_backbone = args.get('freeze_backbone', False)
         self.lidar_range = args['lidar_range']
+        self.anchor_number = args['anchor_number']
+        self.box_code_size = args.get('box_code_size', 8)
+        self.speed_norm = float(args.get('speed_norm', 30.0))
         bev_channels = 128 * 3
         planning_args = args.get('planning_head', {})
         self.use_planning_head = planning_args.get('enabled', False)
+        self.use_velocity_in_planning = bool(
+            planning_args.get('use_velocity_in_planning', False))
         self.input_frame = int(planning_args.get(
             'input_frame', args.get('history_frames', 5)))
+        self.occupancy_channels = 7 if self.use_velocity_in_planning else 6
 
         # PIllar VFE
         self.pillar_vfe = PillarVFE(
@@ -46,7 +53,7 @@ class PointPillar(nn.Module):
 
         self.cls_head = nn.Conv2d(bev_channels, args['anchor_number'],
                                   kernel_size=1)
-        box_code_size = args.get('box_code_size', 8)
+        box_code_size = self.box_code_size
 
         self.reg_head = nn.Conv2d(
             bev_channels,
@@ -69,6 +76,7 @@ class PointPillar(nn.Module):
                 feature_dir=planner_in,
                 input_frame=self.input_frame,
                 output_points=planning_args.get('num_waypoints', 10),
+                occupancy_channels=self.occupancy_channels,
             )
 
     def encode_frame(self, processed_lidar):
@@ -81,9 +89,52 @@ class PointPillar(nn.Module):
         batch_dict = self.backbone(batch_dict)
         return batch_dict['spatial_features_2d']
 
-    def build_v2xverse_occupancy(self, data_dict, h, w, device):
+    def predicted_speed_bev(self, psm, rm):
         """
-        Build V2Xverse-style occupancy [B, T, 6, H, W] and target [B, 2].
+        Soft BEV speed map from frozen detection heads.
+
+        psm: [B, A, H, W], rm: [B, A * box_code_size, H, W]
+        Returns normalized speed in roughly [0, 1+] as [B, 1, H, W].
+        """
+        assert self.box_code_size >= 8, (
+            "predicted speed requires box_code_size >= 8")
+        b, a, h, w = psm.shape
+        rm = rm.view(b, a, self.box_code_size, h, w)
+        # Network regresses speed / speed_norm (see VoxelPostprocessor).
+        speed_normed = rm[:, :, 7, :, :]
+        scores = torch.sigmoid(psm)
+        denom = scores.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        vel = (scores * speed_normed).sum(dim=1, keepdim=True) / denom
+        return vel.clamp(0.0, 2.0)
+
+    def history_predicted_velocity_maps(self, hist_feats):
+        """
+        Per-history-frame predicted velocity BEV maps [B, T, 1, H, W].
+
+        Uses the same dual-frame temporal fusion + cls/reg heads as detection
+        so the planner consumes the course-project velocity prediction, not GT.
+        """
+        t_len = hist_feats.shape[1]
+        vel_maps = []
+        for t in range(t_len):
+            feat_t = hist_feats[:, t]
+            if self.dual_frame:
+                feat_prev = hist_feats[:, max(t - 1, 0)]
+                feat = self.temporal_fusion(
+                    torch.cat([feat_t, feat_prev], dim=1))
+            else:
+                feat = feat_t
+            if self.freeze_backbone:
+                feat = feat.detach()
+            psm_t = self.cls_head(feat)
+            rm_t = self.reg_head(feat)
+            vel_maps.append(self.predicted_speed_bev(psm_t, rm_t))
+        return torch.stack(vel_maps, dim=1)
+
+    def build_v2xverse_occupancy(self, data_dict, h, w, device,
+                                 velocity_maps=None):
+        """
+        Build V2Xverse-style occupancy [B, T, C, H, W] and target [B, 2].
 
         Channel meanings (V2Xverse pnp_dataset / generate_planning_input):
           0: other-actor occupancy (per history frame)
@@ -92,6 +143,7 @@ class PointPillar(nn.Module):
           3: metric x coordinate map
           4: metric y coordinate map
           5: drivable-area / road map (zeros on OPV2V; no birdview)
+          6: (optional) predicted actor speed BEV map from detection head
 
         Target is `planning_target` (route command), never a future waypoint.
         """
@@ -105,9 +157,10 @@ class PointPillar(nn.Module):
         batch_size = target.shape[0]
         t_len = self.input_frame
         x_min, y_min, _, x_max, y_max, _ = self.lidar_range
+        n_ch = self.occupancy_channels
 
         occupancy = torch.zeros(
-            batch_size, t_len, 6, h, w, device=device, dtype=torch.float32)
+            batch_size, t_len, n_ch, h, w, device=device, dtype=torch.float32)
 
         history_actor_xy = data_dict.get('history_actor_xy', None)
         history_actor_mask = data_dict.get('history_actor_mask', None)
@@ -164,6 +217,21 @@ class PointPillar(nn.Module):
         occupancy[:, :, 4:5] = ys.expand(batch_size, t_len, 1, h, w)
         # channel 5: road/drivable map unavailable on OPV2V -> zeros
 
+        if self.use_velocity_in_planning:
+            assert velocity_maps is not None, (
+                "use_velocity_in_planning requires velocity_maps")
+            assert velocity_maps.shape[:2] == (batch_size, t_len), (
+                "velocity_maps shape %s does not match occupancy batch/time"
+                % (tuple(velocity_maps.shape),))
+            if velocity_maps.shape[-2:] != (h, w):
+                flat = velocity_maps.view(
+                    batch_size * t_len, 1,
+                    velocity_maps.shape[-2], velocity_maps.shape[-1])
+                flat = F.interpolate(
+                    flat, size=(h, w), mode='bilinear', align_corners=False)
+                velocity_maps = flat.view(batch_size, t_len, 1, h, w)
+            occupancy[:, :, 6:7] = velocity_maps
+
         return occupancy, target
 
     def forward(self, data_dict):
@@ -211,6 +279,13 @@ class PointPillar(nn.Module):
                 "Expected %d history BEV frames, got %d"
                 % (self.input_frame, feature_seq.shape[1]))
 
+            velocity_maps = None
+            if self.use_velocity_in_planning:
+                # Predicted speed from frozen det heads (before planner adapter).
+                with torch.no_grad():
+                    velocity_maps = self.history_predicted_velocity_maps(
+                        feature_seq)
+
             # Planner-owned adapter (trainable) after frozen BEV features.
             b, t, c, h, w = feature_seq.shape
             feat_flat = feature_seq.view(b * t, c, h, w)
@@ -220,7 +295,8 @@ class PointPillar(nn.Module):
                 b, t, feat_flat.shape[1], h, w)
 
             occupancy, target = self.build_v2xverse_occupancy(
-                data_dict, h, w, feature_seq.device)
+                data_dict, h, w, feature_seq.device,
+                velocity_maps=velocity_maps)
 
             # Leakage guards (training + eval): target must not be GT endpoint.
             if 'future_waypoints' in data_dict:

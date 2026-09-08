@@ -53,10 +53,13 @@ class V2XVersePlanningHead(nn.Module):
     V2Xverse WaypointPlanner_e2e adapted for OpenCOOD PointPillar BEV features.
     Expects input_frame=5 and output_points=10 (Conv3D temporal kernels;
     decoder MLP outputs 20 = 10*2).
+
+    occupancy_channels=6 matches upstream V2Xverse. Set to 7 to append a
+    predicted-velocity BEV channel (ablation); all other layers are unchanged.
     """
 
     def __init__(self, feature_dir: int = 384, input_frame: int = 5,
-                 output_points: int = 10):
+                 output_points: int = 10, occupancy_channels: int = 6):
         super(V2XVersePlanningHead, self).__init__()
         assert input_frame == 5, (
             "V2XVersePlanningHead requires input_frame=5 "
@@ -65,10 +68,14 @@ class V2XVersePlanningHead(nn.Module):
         assert output_points == 10, (
             "V2XVersePlanningHead requires output_points=10"
         )
+        assert occupancy_channels in (6, 7), (
+            "occupancy_channels must be 6 (baseline) or 7 (+velocity)"
+        )
         self.input_frame = input_frame
         self.output_points = output_points
+        self.occupancy_channels = occupancy_channels
 
-        height_feat_size = 6
+        height_feat_size = occupancy_channels
         self.conv_pre_1 = nn.Conv2d(
             height_feat_size, 32, kernel_size=3, stride=1, padding=1)
         self.conv_pre_2 = nn.Conv2d(
@@ -115,8 +122,12 @@ class V2XVersePlanningHead(nn.Module):
         self.target_encoder = MLP(2, 128, hid_feat=(16, 64))
 
     def forward(self, input_data: Dict) -> Dict:
-        occupancy = input_data["occupancy"]  # [B, 5, 6, H, W]
+        occupancy = input_data["occupancy"]  # [B, 5, C, H, W], C in {6, 7}
         batch, seq, c, h, w = occupancy.size()
+        assert c == self.occupancy_channels, (
+            "occupancy has %d channels, expected %d"
+            % (c, self.occupancy_channels)
+        )
 
         x = occupancy.view(-1, c, h, w)
         x = F.relu(self.bn_pre_1(self.conv_pre_1(x)))
