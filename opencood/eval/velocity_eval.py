@@ -555,7 +555,7 @@ def main():
     parser.add_argument("--csv_path", default=None)
     parser.add_argument("--scenario_indices", type=int, nargs="+", default=None)
     parser.add_argument("--list_scenarios", action="store_true")
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--debug_batch", action="store_true", help="Print ego keys/shapes and stop before evaluation.")
     parser.add_argument("--debug_model_call", action="store_true", help="Print which model call pattern is attempted.")
     parser.add_argument("--speed_idx", type=int, default=7, help="Column index for speed in decoded boxes and GT boxes.")
@@ -598,8 +598,12 @@ def main():
         num_workers=args.num_workers,
         collate_fn=dataset.collate_batch_test,
         shuffle=False,
-        pin_memory=False,
+        pin_memory=torch.cuda.is_available(),
         drop_last=False,
+        **({
+            "persistent_workers": True,
+            "prefetch_factor": 4,
+        } if args.num_workers > 0 else {}),
     )
 
     print("Dataloader length:", len(data_loader))
@@ -634,7 +638,8 @@ def main():
             info = get_dataset_sample_info(dataset, original_idx)
             evaluated_batches += 1
 
-            batch_data = train_utils.to_device(batch_data, torch.device("cuda"))
+            batch_data = train_utils.to_device(
+                batch_data, torch.device("cuda"), non_blocking=True)
             ego_data = batch_data["ego"]
 
             if args.debug_batch:

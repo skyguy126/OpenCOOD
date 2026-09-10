@@ -240,15 +240,18 @@ def main():
     print(f"Building held-out eval dataset from: {HELD_OUT_TEST_DIR}")
     dataset = build_dataset(hypes, visualize=True, train=False)
 
-    data_loader = DataLoader(
-        dataset,
-        batch_size=1,
-        num_workers=opt.num_workers,
-        collate_fn=dataset.collate_batch_test,
-        shuffle=False,
-        pin_memory=False,
-        drop_last=False,
-    )
+    loader_kwargs = {
+        "batch_size": 1,
+        "num_workers": opt.num_workers,
+        "collate_fn": dataset.collate_batch_test,
+        "shuffle": False,
+        "pin_memory": torch.cuda.is_available(),
+        "drop_last": False,
+    }
+    if opt.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
+    data_loader = DataLoader(dataset, **loader_kwargs)
 
     print(f"Dataset size: {len(dataset)}")
 
@@ -285,7 +288,8 @@ def main():
             skipped += 1
             continue
 
-        batch_data = train_utils.to_device(batch_data, device)
+        batch_data = train_utils.to_device(
+            batch_data, device, non_blocking=torch.cuda.is_available())
 
         if "ego" not in batch_data:
             raise KeyError("Expected batch_data['ego'], but it was not found.")

@@ -113,23 +113,24 @@ class PointPillar(nn.Module):
 
         Uses the same dual-frame temporal fusion + cls/reg heads as detection
         so the planner consumes the course-project velocity prediction, not GT.
+        Batched over time to avoid serial GPU launches.
         """
-        t_len = hist_feats.shape[1]
-        vel_maps = []
-        for t in range(t_len):
-            feat_t = hist_feats[:, t]
-            if self.dual_frame:
-                feat_prev = hist_feats[:, max(t - 1, 0)]
-                feat = self.temporal_fusion(
-                    torch.cat([feat_t, feat_prev], dim=1))
-            else:
-                feat = feat_t
-            if self.freeze_backbone:
-                feat = feat.detach()
-            psm_t = self.cls_head(feat)
-            rm_t = self.reg_head(feat)
-            vel_maps.append(self.predicted_speed_bev(psm_t, rm_t))
-        return torch.stack(vel_maps, dim=1)
+        b, t_len, c, h, w = hist_feats.shape
+        feat_t = hist_feats
+        if self.dual_frame:
+            feat_prev = torch.cat(
+                [hist_feats[:, :1], hist_feats[:, :-1]], dim=1)
+            fused = self.temporal_fusion(
+                torch.cat([feat_t, feat_prev], dim=2).reshape(
+                    b * t_len, c * 2, h, w))
+        else:
+            fused = feat_t.reshape(b * t_len, c, h, w)
+        if self.freeze_backbone:
+            fused = fused.detach()
+        psm_t = self.cls_head(fused)
+        rm_t = self.reg_head(fused)
+        vel = self.predicted_speed_bev(psm_t, rm_t)
+        return vel.view(b, t_len, 1, h, w)
 
     def build_v2xverse_occupancy(self, data_dict, h, w, device,
                                  velocity_maps=None):
@@ -150,7 +151,8 @@ class PointPillar(nn.Module):
         assert 'planning_target' in data_dict, (
             "planning_target missing — refusing to derive target from "
             "future_waypoints (endpoint leakage).")
-        target = data_dict['planning_target'].to(device=device, dtype=torch.float32)
+        target = data_dict['planning_target'].to(
+            device=device, dtype=torch.float32, non_blocking=True)
         if target.ndim == 1:
             target = target.unsqueeze(0)
 
@@ -167,55 +169,72 @@ class PointPillar(nn.Module):
         history_ego_xy = data_dict.get('history_ego_xy', None)
 
         def xy_to_idx(xy):
-            # xy: [..., 2] in ego meters -> (x_idx along W, y_idx along H)
             x_idx = ((xy[..., 0] - x_min) / (x_max - x_min) * (w - 1)).long()
             y_idx = ((xy[..., 1] - y_min) / (y_max - y_min) * (h - 1)).long()
             x_idx = torch.clamp(x_idx, 0, w - 1)
             y_idx = torch.clamp(y_idx, 0, h - 1)
             return x_idx, y_idx
 
-        for t in range(t_len):
-            # channel 0: actors at history timestamp t
-            if history_actor_xy is not None and history_actor_mask is not None:
-                centers = history_actor_xy[:, t]  # [B, max_num, 2]
-                mask = history_actor_mask[:, t].bool()
-                for b in range(batch_size):
-                    valid = centers[b][mask[b]]
-                    if valid.numel() == 0:
-                        continue
-                    x_idx, y_idx = xy_to_idx(valid)
-                    occupancy[b, t, 0, y_idx, x_idx] = 1.0
-            else:
-                # Fallback: current-frame boxes only (still no future leakage).
-                centers = data_dict['object_bbx_center'][..., :2]
-                mask = data_dict['object_bbx_mask'].bool()
-                for b in range(batch_size):
-                    valid = centers[b][mask[b]]
-                    if valid.numel() == 0:
-                        continue
-                    x_idx, y_idx = xy_to_idx(valid)
-                    occupancy[b, t, 0, y_idx, x_idx] = 1.0
+        if history_actor_xy is not None and history_actor_mask is not None:
+            for t in range(t_len):
+                centers = history_actor_xy[:, t].to(
+                    device=device, non_blocking=True)
+                mask = history_actor_mask[:, t].to(
+                    device=device, non_blocking=True)
+                x_idx, y_idx = xy_to_idx(centers)
+                b_idx = torch.arange(
+                    batch_size, device=device).view(
+                        batch_size, 1).expand_as(x_idx)
+                valid = mask.bool()
+                if valid.any():
+                    occupancy[b_idx[valid], t, 0,
+                              y_idx[valid], x_idx[valid]] = 1.0
+        else:
+            centers = data_dict['object_bbx_center'][..., :2].to(
+                device=device, non_blocking=True)
+            mask = data_dict['object_bbx_mask'].to(
+                device=device, non_blocking=True)
+            x_idx, y_idx = xy_to_idx(centers)
+            b_idx = torch.arange(
+                batch_size, device=device).view(
+                    batch_size, 1).expand_as(x_idx)
+            valid = mask.bool()
+            if valid.any():
+                vb = b_idx[valid]
+                vy = y_idx[valid]
+                vx = x_idx[valid]
+                for t in range(t_len):
+                    occupancy[vb, t, 0, vy, vx] = 1.0
 
-            # channel 1: ego occupancy at past ego position in current frame
-            if history_ego_xy is not None:
-                ego_xy = history_ego_xy[:, t]  # [B, 2]
-            else:
-                ego_xy = torch.zeros(batch_size, 2, device=device)
-            ex, ey = xy_to_idx(ego_xy)
-            for b in range(batch_size):
-                occupancy[b, t, 1, ey[b], ex[b]] = 1.0
+        if history_ego_xy is not None:
+            ego_xy = history_ego_xy.to(device=device, non_blocking=True)
+        else:
+            ego_xy = torch.zeros(
+                batch_size, t_len, 2, device=device, dtype=torch.float32)
+        if ego_xy.ndim == 2:
+            ego_xy = ego_xy.unsqueeze(1).expand(-1, t_len, -1)
+        ex, ey = xy_to_idx(ego_xy)
+        b_idx = torch.arange(batch_size, device=device).view(
+            batch_size, 1).expand_as(ex)
+        t_idx = torch.arange(t_len, device=device).view(
+            1, t_len).expand_as(ex)
+        occupancy[b_idx.reshape(-1), t_idx.reshape(-1), 1,
+                  ey.reshape(-1), ex.reshape(-1)] = 1.0
 
-            # channel 2: local command / target point (same across time)
-            tx, ty = xy_to_idx(target)
-            for b in range(batch_size):
-                occupancy[b, t, 2, ty[b], tx[b]] = 1.0
+        tx, ty = xy_to_idx(target)
+        b_idx = torch.arange(batch_size, device=device).view(batch_size, 1).expand(
+            batch_size, t_len)
+        t_idx = torch.arange(t_len, device=device).view(1, t_len).expand(
+            batch_size, t_len)
+        ty_exp = ty.view(batch_size, 1).expand(batch_size, t_len)
+        tx_exp = tx.view(batch_size, 1).expand(batch_size, t_len)
+        occupancy[b_idx.reshape(-1), t_idx.reshape(-1), 2,
+                  ty_exp.reshape(-1), tx_exp.reshape(-1)] = 1.0
 
-        # channels 3/4: metric coordinate maps (V2Xverse-style, not 0-1)
         xs = torch.linspace(x_min, x_max, w, device=device).view(1, 1, 1, w)
         ys = torch.linspace(y_min, y_max, h, device=device).view(1, 1, h, 1)
         occupancy[:, :, 3:4] = xs.expand(batch_size, t_len, 1, h, w)
         occupancy[:, :, 4:5] = ys.expand(batch_size, t_len, 1, h, w)
-        # channel 5: road/drivable map unavailable on OPV2V -> zeros
 
         if self.use_velocity_in_planning:
             assert velocity_maps is not None, (

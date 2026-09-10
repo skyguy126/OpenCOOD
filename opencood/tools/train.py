@@ -105,6 +105,14 @@ def main():
     opencood_train_dataset = build_dataset(hypes, visualize=False, train=True)
     opencood_validate_dataset = build_dataset(hypes, visualize=False, train=False)
 
+    loader_train_kwargs = train_utils.dataloader_kwargs(
+        train_params, distributed=opt.distributed, shuffle=True,
+        drop_last=True, is_train=True)
+    loader_val_kwargs = train_utils.dataloader_kwargs(
+        train_params, distributed=opt.distributed, shuffle=False,
+        drop_last=False, is_train=False)
+    loader_val_kwargs['drop_last'] = False
+
     if opt.distributed:
         sampler_train = DistributedSampler(opencood_train_dataset)
         sampler_val = DistributedSampler(opencood_validate_dataset,
@@ -113,37 +121,51 @@ def main():
         batch_sampler_train = torch.utils.data.BatchSampler(
             sampler_train, hypes['train_params']['batch_size'], drop_last=True)
 
-        train_loader = DataLoader(opencood_train_dataset,
-                                  batch_sampler=batch_sampler_train,
-                                  num_workers=8,
-                                  collate_fn=opencood_train_dataset.collate_batch_train)
-        val_loader = DataLoader(opencood_validate_dataset,
-                                sampler=sampler_val,
-                                num_workers=8,
-                                collate_fn=opencood_train_dataset.collate_batch_train,
-                                drop_last=False)
+        dist_train_kwargs = {
+            k: v for k, v in loader_train_kwargs.items()
+            if k not in ('shuffle', 'drop_last')
+        }
+        dist_val_kwargs = {
+            k: v for k, v in loader_val_kwargs.items()
+            if k not in ('shuffle',)
+        }
+
+        train_loader = DataLoader(
+            opencood_train_dataset,
+            batch_sampler=batch_sampler_train,
+            collate_fn=opencood_train_dataset.collate_batch_train,
+            **dist_train_kwargs)
+        val_loader = DataLoader(
+            opencood_validate_dataset,
+            sampler=sampler_val,
+            batch_size=hypes['train_params']['batch_size'],
+            collate_fn=opencood_train_dataset.collate_batch_train,
+            **dist_val_kwargs)
         print("DEBUG validation dataset length:", len(opencood_validate_dataset))
-        print("DEBUG validation dataloader length:", len(val_loader)) 
-    
+        print("DEBUG validation dataloader length:", len(val_loader))
+
     else:
-        train_loader = DataLoader(opencood_train_dataset,
-                                  batch_size=hypes['train_params']['batch_size'],
-                                  num_workers=8,
-                                  collate_fn=opencood_train_dataset.collate_batch_train,
-                                  shuffle=True,
-                                  pin_memory=False,
-                                  drop_last=True)
-        val_loader = DataLoader(opencood_validate_dataset,
-                                batch_size=hypes['train_params']['batch_size'],
-                                num_workers=8,
-                                collate_fn=opencood_train_dataset.collate_batch_train,
-                                shuffle=False,
-                                pin_memory=False,
-                                drop_last=True)
+        train_loader = DataLoader(
+            opencood_train_dataset,
+            batch_size=hypes['train_params']['batch_size'],
+            collate_fn=opencood_train_dataset.collate_batch_train,
+            **loader_train_kwargs)
+        val_loader = DataLoader(
+            opencood_validate_dataset,
+            batch_size=hypes['train_params']['batch_size'],
+            collate_fn=opencood_train_dataset.collate_batch_train,
+            **loader_val_kwargs)
 
         print("DEBUG validate_dir:", hypes['validate_dir'])
         print("DEBUG validation dataset length:", len(opencood_validate_dataset))
         print("DEBUG validation dataloader length:", len(val_loader))
+
+    print('DataLoader: num_workers=%d pin_memory=%s prefetch_factor=%s '
+          'persistent_workers=%s'
+          % (loader_train_kwargs.get('num_workers'),
+             loader_train_kwargs.get('pin_memory'),
+             loader_train_kwargs.get('prefetch_factor', 'n/a'),
+             loader_train_kwargs.get('persistent_workers', False)))
 
     print('---------------Creating Model------------------')
     model = train_utils.create_model(hypes)
@@ -177,6 +199,11 @@ def main():
         # init — do not pass --pretrained_dir or training restarts at epoch 0
         # with a randomly initialized planner.
         saved_path = opt.model_dir
+        if not os.path.exists(saved_path):
+            os.makedirs(saved_path)
+        config_path = os.path.join(saved_path, 'config.yaml')
+        if not os.path.exists(config_path):
+            yaml_utils.save_yaml(hypes, config_path)
         init_epoch, model = train_utils.load_saved_model(saved_path, model)
         if freeze_backbone:
             model = train_utils.freeze_backbone(model)
@@ -190,9 +217,10 @@ def main():
 
     if opt.distributed:
         model = \
-            torch.nn.parallel.DistributedDataParallel(model,
-                                                      device_ids=[opt.gpu],
-                                                      find_unused_parameters=True)
+            torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[opt.gpu],
+                find_unused_parameters=False)
         model_without_ddp = model.module
 
     # define the loss
@@ -221,6 +249,24 @@ def main():
     step_scheduler_at_epoch_start = scheduler_method not in (
         'cosineannealinglr', 'cosineannealing', 'cosineannealwarm')
 
+    is_main_process = (not opt.distributed) or (getattr(opt, 'rank', 0) == 0)
+    best_val_loss = float('inf')
+    best_epoch = -1
+    best_meta_path = os.path.join(saved_path, 'best_epoch.yaml')
+    if os.path.exists(best_meta_path):
+        try:
+            import yaml as _yaml
+            with open(best_meta_path, 'r') as f:
+                best_meta = _yaml.safe_load(f) or {}
+            best_epoch = int(best_meta.get('best_epoch', -1))
+            best_val_loss = float(best_meta.get('metric_value', best_val_loss))
+            print('Resumed best-epoch tracker: epoch=%d val_loss=%.6f'
+                  % (best_epoch, best_val_loss))
+        except Exception as e:
+            print('Warning: could not load best_epoch.yaml (%s)' % e)
+
+    use_cuda = torch.cuda.is_available()
+
     for epoch in range(init_epoch, max(epoches, init_epoch)):
         if step_scheduler_at_epoch_start:
             if scheduler_method != 'cosineannealwarm':
@@ -233,15 +279,17 @@ def main():
         if opt.distributed:
             sampler_train.set_epoch(epoch)
 
+        train_utils.configure_frozen_training(model_without_ddp,
+                                              freeze_backbone)
+
         pbar2 = tqdm.tqdm(total=len(train_loader), leave=True)
 
         for i, batch_data in enumerate(train_loader):
-            train_utils.configure_frozen_training(model_without_ddp,
-                                                  freeze_backbone)
             model.zero_grad()
             optimizer.zero_grad()
 
-            batch_data = train_utils.to_device(batch_data, device)
+            batch_data = train_utils.to_device(
+                batch_data, device, non_blocking=use_cuda)
 
             # case1 : late fusion train --> only ego needed,
             # and ego is random selected
@@ -297,19 +345,18 @@ def main():
         if scheduler_method in ('cosineannealinglr', 'cosineannealing'):
             scheduler.step()
 
-        if epoch % hypes['train_params']['save_freq'] == 0:
+        if epoch % hypes['train_params']['save_freq'] == 0 and is_main_process:
             torch.save(model_without_ddp.state_dict(),
                 os.path.join(saved_path, 'net_epoch%d.pth' % (epoch + 1)))
 
         if epoch % hypes['train_params']['eval_freq'] == 0:
             valid_ave_loss = []
+            model_without_ddp.eval()
 
             with torch.no_grad():
                 for i, batch_data in enumerate(val_loader):
-                    train_utils.configure_frozen_training(
-                        model_without_ddp, freeze_backbone)
-
-                    batch_data = train_utils.to_device(batch_data, device)
+                    batch_data = train_utils.to_device(
+                        batch_data, device, non_blocking=use_cuda)
                     ouput_dict = model(batch_data['ego'])
                     target_dict = batch_data['ego']['label_dict']
                     if planning_head_cfg.get('enabled', False):
@@ -318,20 +365,34 @@ def main():
 
                     final_loss = criterion(ouput_dict, target_dict)
                     valid_ave_loss.append(final_loss.item())
-            # valid_ave_loss = statistics.mean(valid_ave_loss)
-            # print('At epoch %d, the validation loss is %f' % (epoch,
-            #                                                   valid_ave_loss))
 
             if len(valid_ave_loss) > 0:
                 valid_ave_loss = statistics.mean(valid_ave_loss)
-                print('At epoch %d, the validation loss is %f' % (epoch, valid_ave_loss))
+                print('At epoch %d, the validation loss is %f' % (epoch,
+                                                                  valid_ave_loss))
             else:
-                print('At epoch %d, validation skipped: no validation batches.' % epoch)
+                print('At epoch %d, validation skipped: no validation batches.'
+                      % epoch)
                 valid_ave_loss = None
-            
+
             if valid_ave_loss is not None:
                 writer.add_scalar('Validate_Loss', valid_ave_loss, epoch)
+                if is_main_process and valid_ave_loss < best_val_loss:
+                    best_val_loss = valid_ave_loss
+                    best_epoch = epoch + 1
+                    train_utils.save_best_checkpoint(
+                        model_without_ddp, saved_path, best_epoch,
+                        'val_loss', best_val_loss)
+                    print('New best epoch %d (val_loss=%.6f) -> net_best.pth'
+                          % (best_epoch, best_val_loss))
+                    writer.add_scalar('Best_Val_Loss', best_val_loss, epoch)
 
+            train_utils.configure_frozen_training(model_without_ddp,
+                                                  freeze_backbone)
+
+    if is_main_process and best_epoch > 0:
+        print('Best epoch: %d (val_loss=%.6f) saved as net_best.pth'
+              % (best_epoch, best_val_loss))
     print('Training Finished, checkpoints saved to %s' % saved_path)
 
 

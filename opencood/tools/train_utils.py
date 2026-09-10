@@ -40,9 +40,11 @@ def load_saved_model(saved_path, model):
         if file_list:
             epochs_exist = []
             for file_ in file_list:
-                result = re.findall(".*epoch(.*).pth.*", file_)
-                epochs_exist.append(int(result[0]))
-            initial_epoch_ = max(epochs_exist)
+                result = re.findall(r"net_epoch(\d+)\.pth$",
+                                    os.path.basename(file_))
+                if result:
+                    epochs_exist.append(int(result[0]))
+            initial_epoch_ = max(epochs_exist) if epochs_exist else 0
         else:
             initial_epoch_ = 0
         return initial_epoch_
@@ -330,13 +332,69 @@ def setup_lr_schedular(hypes, optimizer, n_iter_per_epoch):
     return scheduler
 
 
-def to_device(inputs, device):
+def to_device(inputs, device, non_blocking=True):
+    """
+    Recursively move nested batch structures to device.
+
+    non_blocking=True overlaps H2D with compute when the DataLoader uses
+    pin_memory=True; otherwise it is a no-op for pageable host memory.
+    """
     if isinstance(inputs, list):
-        return [to_device(x, device) for x in inputs]
+        return [to_device(x, device, non_blocking=non_blocking) for x in inputs]
     elif isinstance(inputs, dict):
-        return {k: to_device(v, device) for k, v in inputs.items()}
+        return {k: to_device(v, device, non_blocking=non_blocking)
+                for k, v in inputs.items()}
     else:
         if isinstance(inputs, int) or isinstance(inputs, float) \
                 or isinstance(inputs, str):
             return inputs
-        return inputs.to(device)
+        if torch.is_tensor(inputs):
+            return inputs.to(device, non_blocking=non_blocking)
+        return inputs
+
+
+def dataloader_kwargs(train_params, distributed=False, shuffle=True,
+                      drop_last=True, is_train=True):
+    """
+    Shared DataLoader settings aimed at keeping the GPU fed.
+    """
+    num_workers = int(train_params.get('num_workers', 8))
+    pin_memory = bool(train_params.get('pin_memory', torch.cuda.is_available()))
+    prefetch_factor = int(train_params.get('prefetch_factor', 4))
+    persistent_workers = bool(train_params.get(
+        'persistent_workers', num_workers > 0))
+
+    kwargs = {
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+        'drop_last': drop_last,
+    }
+    if not distributed:
+        kwargs['shuffle'] = shuffle
+    if num_workers > 0:
+        kwargs['prefetch_factor'] = prefetch_factor
+        kwargs['persistent_workers'] = persistent_workers
+    return kwargs
+
+
+def save_best_checkpoint(model, saved_path, epoch, metric_name, metric_value):
+    """
+    Persist best-so-far weights plus a small sidecar for resume/reporting.
+
+    epoch is 1-indexed to match net_epoch{N}.pth naming.
+    """
+    best_ckpt = os.path.join(saved_path, 'net_best.pth')
+    torch.save(model.state_dict(), best_ckpt)
+    meta = {
+        'best_epoch': int(epoch),
+        'metric_name': str(metric_name),
+        'metric_value': float(metric_value),
+        'checkpoint': 'net_best.pth',
+    }
+    meta_path = os.path.join(saved_path, 'best_epoch.yaml')
+    with open(meta_path, 'w') as f:
+        yaml.dump(meta, f, default_flow_style=False)
+    with open(os.path.join(saved_path, 'best_epoch.txt'), 'w') as f:
+        f.write('best_epoch=%d %s=%.6f checkpoint=net_best.pth\n'
+                % (epoch, metric_name, metric_value))
+    return best_ckpt

@@ -16,6 +16,10 @@ train_params:
   freeze_backbone: true
   # Match V2Xverse model_decoration.clip_grad=10 (implemented as grad-norm clip).
   gradient_clip_norm: 10
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 4
+  persistent_workers: true
 
 fusion:
   core_method: 'EarlyFusionDataset' # LateFusionDataset, EarlyFusionDataset, IntermediateFusionDataset supported

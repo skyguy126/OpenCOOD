@@ -62,13 +62,18 @@ def main():
     print('Dataset Building')
     opencood_dataset = build_dataset(hypes, visualize=True, train=False)
     print(f"{len(opencood_dataset)} samples found.")
-    data_loader = DataLoader(opencood_dataset,
-                             batch_size=1,
-                             num_workers=16,
-                             collate_fn=opencood_dataset.collate_batch_test,
-                             shuffle=False,
-                             pin_memory=False,
-                             drop_last=False)
+    loader_kwargs = dict(
+        batch_size=1,
+        num_workers=16,
+        collate_fn=opencood_dataset.collate_batch_test,
+        shuffle=False,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+    if loader_kwargs["num_workers"] > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
+    data_loader = DataLoader(opencood_dataset, **loader_kwargs)
 
     print('Creating Model')
     model = train_utils.create_model(hypes)
@@ -108,7 +113,8 @@ def main():
     for i, batch_data in tqdm(enumerate(data_loader)):
         # print(i)
         with torch.no_grad():
-            batch_data = train_utils.to_device(batch_data, device)
+            batch_data = train_utils.to_device(
+                batch_data, device, non_blocking=torch.cuda.is_available())
             if opt.fusion_method == 'late':
                 pred_box_tensor, pred_score, gt_box_tensor = \
                     inference_utils.inference_late_fusion(batch_data,
