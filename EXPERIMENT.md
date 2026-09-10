@@ -60,3 +60,52 @@ CUDA_VISIBLE_DEVICES=0 python opencood/tools/train.py \
   --pretrained_dir /home/project/x2_multiframe \
   --model_dir /home/project/path_v2xverse
 ```
+
+---
+
+# Experiment 2
+
+Same dual-frame early fusion as Exp 1, but **detection only** (`box_code_size: 7`, no speed head/loss). Velocity is not trained and not fed to the planner.
+
+## Metrics (OPV2V test)
+
+| Task | Metric | Value |
+|------|--------|-------|
+| Detection | AP@0.5 | TBD |
+| Detection | AP@0.7 | TBD |
+| Planning | ADE (mean) | TBD |
+| Planning | FDE (mean) | TBD |
+
+## Hyperparameters
+
+| | Backbone | Planner |
+|--|----------|---------|
+| Config | `point_pillar_early_fusion_x2_det_only.yaml` | `point_pillar_early_fusion_baseline_det_only.yaml` |
+| Epochs | 30 scheduled (best TBD) | 50 |
+| Batch size | 2 | 2 |
+| Optimizer | Adam, lr 0.002 | AdamW, lr 1e-4 |
+| LR schedule | MultiStep [10, 15], γ=0.1 | CosineAnnealingLR, T_max=50 |
+| Fusion | Early, `dual_frame: true` | Early, frozen backbone, `planning_only` |
+| Loss | cls 1.0, reg 2.0 (no speed) | planning L1, weight 1.0 |
+| Planner I/O | — | 5 history frames → 10 waypoints |
+| Grad clip | — | 10 |
+
+## Paths
+
+| | Path |
+|--|------|
+| Backbone (best) | `/home/project/x2_detection_only/net_best.pth` (or `net_epochN.pth`) |
+| Planner (best) | `/home/project/path_v2xverse_det_only/` (TBD) |
+
+## Train commands
+
+```bash
+# Backbone (detection only, 3 GPUs)
+cd /media/Disk2/OpenCOOD_vamsi_2 && CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_x2_det_only.yaml --model_dir /home/project/x2_detection_only
+
+# Planner (frozen backbone; run after backbone finishes)
+CUDA_VISIBLE_DEVICES=0 python opencood/tools/train.py \
+  --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_baseline_det_only.yaml \
+  --pretrained_dir /home/project/x2_detection_only \
+  --model_dir /home/project/path_v2xverse_det_only
+```
