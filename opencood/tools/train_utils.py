@@ -356,13 +356,35 @@ def to_device(inputs, device, non_blocking=True):
 def dataloader_kwargs(train_params, distributed=False, shuffle=True,
                       drop_last=True, is_train=True):
     """
-    Shared DataLoader settings aimed at keeping the GPU fed.
+    Shared DataLoader settings aimed at keeping the GPU fed without
+    permanently doubling worker pools under DDP.
+
+    Val loaders default to non-persistent workers so they are torn down
+    after each validation pass (avoids train+val worker pile-up).
     """
-    num_workers = int(train_params.get('num_workers', 8))
+    if is_train:
+        num_workers = int(train_params.get('num_workers', 4))
+        prefetch_factor = int(train_params.get('prefetch_factor', 2))
+        # Default False: safer under multi-GPU; enable explicitly in yaml
+        # if desired.
+        persistent_workers = bool(train_params.get('persistent_workers', False))
+    else:
+        num_workers = int(train_params.get(
+            'val_num_workers', train_params.get('num_workers', 2)))
+        prefetch_factor = int(train_params.get(
+            'val_prefetch_factor', train_params.get('prefetch_factor', 2)))
+        # Critical: do not keep val workers alive across epochs.
+        persistent_workers = bool(
+            train_params.get('val_persistent_workers', False))
+
+    if distributed:
+        cap_key = 'max_workers_per_rank_train' if is_train else \
+            'max_workers_per_rank_val'
+        default_cap = 4 if is_train else 2
+        num_workers = min(
+            num_workers, int(train_params.get(cap_key, default_cap)))
+
     pin_memory = bool(train_params.get('pin_memory', torch.cuda.is_available()))
-    prefetch_factor = int(train_params.get('prefetch_factor', 4))
-    persistent_workers = bool(train_params.get(
-        'persistent_workers', num_workers > 0))
 
     kwargs = {
         'num_workers': num_workers,

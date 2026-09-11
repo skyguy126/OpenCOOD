@@ -53,9 +53,22 @@ def main():
     pretrained_dir = opt.pretrained_dir or train_params.get('pretrained_dir', '')
 
     # Resume an existing run (uses model_dir/config.yaml).
+    # Overlay DataLoader keys from the explicitly passed --hypes_yaml so
+    # loader patches take effect without rewriting the saved config.
     if opt.model_dir and not pretrained_dir:
+        repo_train_params = dict(train_params)
         hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
         train_params = hypes.get('train_params', {})
+        loader_keys = (
+            'num_workers', 'val_num_workers', 'pin_memory',
+            'prefetch_factor', 'val_prefetch_factor',
+            'persistent_workers', 'val_persistent_workers',
+            'max_workers_per_rank_train', 'max_workers_per_rank_val',
+        )
+        for key in loader_keys:
+            if key in repo_train_params:
+                train_params[key] = repo_train_params[key]
+        hypes['train_params'] = train_params
 
     pretrained_dir = opt.pretrained_dir or train_params.get('pretrained_dir', '')
     freeze_backbone = train_params.get('freeze_backbone', False)
@@ -160,12 +173,18 @@ def main():
         print("DEBUG validation dataset length:", len(opencood_validate_dataset))
         print("DEBUG validation dataloader length:", len(val_loader))
 
-    print('DataLoader: num_workers=%d pin_memory=%s prefetch_factor=%s '
+    print('DataLoader train: num_workers=%d pin_memory=%s prefetch_factor=%s '
           'persistent_workers=%s'
           % (loader_train_kwargs.get('num_workers'),
              loader_train_kwargs.get('pin_memory'),
              loader_train_kwargs.get('prefetch_factor', 'n/a'),
              loader_train_kwargs.get('persistent_workers', False)))
+    print('DataLoader val:   num_workers=%d pin_memory=%s prefetch_factor=%s '
+          'persistent_workers=%s'
+          % (loader_val_kwargs.get('num_workers'),
+             loader_val_kwargs.get('pin_memory'),
+             loader_val_kwargs.get('prefetch_factor', 'n/a'),
+             loader_val_kwargs.get('persistent_workers', False)))
 
     print('---------------Creating Model------------------')
     model = train_utils.create_model(hypes)
