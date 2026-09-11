@@ -118,6 +118,14 @@ class V2XVersePlanningHead(nn.Module):
 
         self.bn3_1 = nn.BatchNorm2d(256)
 
+        # Learned spatial attention pooling replacing V2XVerse global mean
+        # pooling (x_3.mean over H×W). 1×1 MLP scorer: 256 -> 64 -> 1.
+        self.spatial_attn = nn.Sequential(
+            nn.Conv2d(256, 64, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, kernel_size=1),
+        )
+
         self.decoder = MLP(256 + 128, 20, hid_feat=(1025, 512))
         self.target_encoder = MLP(2, 128, hid_feat=(16, 64))
 
@@ -176,7 +184,13 @@ class V2XVersePlanningHead(nn.Module):
 
         x_3 = F.relu(self.bn3_1(self.conv3_1(x_2)))
 
-        feature = x_3.mean(dim=(2, 3))
+        # Learned spatial attention pooling (replaces V2XVerse uniform mean).
+        # One score per spatial cell from 256-D x_3; softmax over H×W; weighted
+        # sum yields the same 256-D feature for the waypoint decoder.
+        attn_logits = self.spatial_attn(x_3)  # [B, 1, H, W]
+        attn = attn_logits.flatten(2).softmax(dim=-1)  # [B, 1, H*W]
+        feature = (x_3.flatten(2) * attn).sum(dim=-1)  # [B, 256]
+
         feature_target = self.target_encoder(input_data["target"])
         future_waypoints = self.decoder(
             torch.cat((feature, feature_target), dim=1)
