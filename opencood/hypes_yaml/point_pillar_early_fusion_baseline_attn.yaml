@@ -12,15 +12,23 @@ yaml_parser: "load_point_pillar_params"
 train_params:
     batch_size: &batch_size 2
     epoches: 50
-    eval_freq: 1
+    # 0 = skip mid-training val; run planning/det eval after on saved epochs.
+    eval_freq: 0
     save_freq: 1
     freeze_backbone: true
     # Match V2Xverse model_decoration.clip_grad=10 (implemented as grad-norm clip).
     gradient_clip_norm: 10
-    num_workers: 8
+    # Best val-loss checkpoint from x2_multiframe (net_epoch15.pth).
+    pretrained_epoch: 15
+    # DDP-safe loader settings (avoid train+val worker pile-up / swap thrash).
+    num_workers: 4
+    val_num_workers: 2
     pin_memory: true
-    prefetch_factor: 4
-    persistent_workers: true
+    prefetch_factor: 2
+    persistent_workers: false
+    val_persistent_workers: false
+    max_workers_per_rank_train: 4
+    max_workers_per_rank_val: 2
 
 fusion:
   core_method: 'EarlyFusionDataset' # LateFusionDataset, EarlyFusionDataset, IntermediateFusionDataset supported

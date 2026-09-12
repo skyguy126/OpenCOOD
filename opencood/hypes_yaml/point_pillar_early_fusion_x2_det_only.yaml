@@ -10,7 +10,8 @@ yaml_parser: "load_point_pillar_params"
 train_params:
   batch_size: &batch_size 2
   epoches: 30
-  eval_freq: 1
+  # 0 = skip mid-training val (gap between epochs); eval saved ckpts after.
+  eval_freq: 0
   save_freq: 1
   freeze_backbone: false
   # DDP-safe loader settings (avoid train+val worker pile-up / swap thrash).

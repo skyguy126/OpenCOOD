@@ -53,19 +53,20 @@ def main():
     pretrained_dir = opt.pretrained_dir or train_params.get('pretrained_dir', '')
 
     # Resume an existing run (uses model_dir/config.yaml).
-    # Overlay DataLoader keys from the explicitly passed --hypes_yaml so
-    # loader patches take effect without rewriting the saved config.
+    # Overlay DataLoader / eval schedule keys from the explicitly passed
+    # --hypes_yaml so patches take effect without rewriting the saved config.
     if opt.model_dir and not pretrained_dir:
         repo_train_params = dict(train_params)
         hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
         train_params = hypes.get('train_params', {})
-        loader_keys = (
+        overlay_keys = (
             'num_workers', 'val_num_workers', 'pin_memory',
             'prefetch_factor', 'val_prefetch_factor',
             'persistent_workers', 'val_persistent_workers',
             'max_workers_per_rank_train', 'max_workers_per_rank_val',
+            'eval_freq', 'save_freq',
         )
-        for key in loader_keys:
+        for key in overlay_keys:
             if key in repo_train_params:
                 train_params[key] = repo_train_params[key]
         hypes['train_params'] = train_params
@@ -368,7 +369,11 @@ def main():
             torch.save(model_without_ddp.state_dict(),
                 os.path.join(saved_path, 'net_epoch%d.pth' % (epoch + 1)))
 
-        if epoch % hypes['train_params']['eval_freq'] == 0:
+        # eval_freq <= 0 disables mid-training validation so epochs chain
+        # without a full val pass. Run inference/eval later on saved epochs
+        # (or net_best.pth from an earlier run) to pick the best checkpoint.
+        eval_freq = int(hypes['train_params'].get('eval_freq', 1))
+        if eval_freq > 0 and epoch % eval_freq == 0:
             valid_ave_loss = []
             model_without_ddp.eval()
 
@@ -408,6 +413,11 @@ def main():
 
             train_utils.configure_frozen_training(model_without_ddp,
                                                   freeze_backbone)
+        elif eval_freq <= 0 and epoch == init_epoch and is_main_process:
+            print('eval_freq=%d: skipping mid-training validation; '
+                  'checkpoints saved every save_freq epoch(s). '
+                  'Run eval after training to select the best epoch.'
+                  % eval_freq)
 
     if is_main_process and best_epoch > 0:
         print('Best epoch: %d (val_loss=%.6f) saved as net_best.pth'
