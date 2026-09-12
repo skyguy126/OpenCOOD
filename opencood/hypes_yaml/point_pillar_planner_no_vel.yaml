@@ -1,0 +1,119 @@
+name: point_pillar_planner_no_vel
+# Frozen attention planner on the detection-only backbone (x2_detection_only).
+# Head is 7D so net_epoch15.pth loads without a reg_head size mismatch.
+# Velocity is not an input to the planner.
+#   --pretrained_dir /home/project/x2_detection_only
+#   --model_dir /home/project/path_v2xverse_det_only_attn
+root_dir: "/media/Disk2/data/OPV2V/opv2v_data_dumping/train"
+validate_dir: "/home/project/validate/validate"
+
+yaml_parser: "load_point_pillar_params"
+train_params:
+  batch_size: &batch_size 2
+  epoches: 50
+  eval_freq: 0
+  save_freq: 1
+  freeze_backbone: true
+  pretrained_dir: "/home/project/x2_detection_only"
+  pretrained_epoch: 15
+  gradient_clip_norm: 10
+  num_workers: 4
+  val_num_workers: 2
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: false
+  val_persistent_workers: false
+  max_workers_per_rank_train: 4
+  max_workers_per_rank_val: 2
+
+fusion:
+  core_method: 'EarlyFusionDataset'
+  args: []
+
+preprocess:
+  core_method: 'SpVoxelPreprocessor'
+  args:
+    voxel_size: &voxel_size [0.4, 0.4, 4]
+    max_points_per_voxel: 32
+    max_voxel_train: 32000
+    max_voxel_test: 70000
+    num_point_features: 4
+  cav_lidar_range: &cav_lidar [-140.8, -40, -3, 140.8, 40, 1]
+
+data_augment: []
+
+postprocess:
+  core_method: 'VoxelPostprocessor'
+  box_code_size: 7
+  anchor_args:
+    cav_lidar_range: *cav_lidar
+    l: 3.9
+    w: 1.6
+    h: 1.56
+    r: [0, 90]
+    num: &achor_num 2
+    box_code_size: 7
+  target_args:
+    pos_threshold: 0.6
+    neg_threshold: 0.45
+    score_threshold: 0.20
+  order: 'hwl'
+  max_num: 100
+  nms_thresh: 0.15
+
+model:
+  core_method: point_pillar
+  args:
+    voxel_size: *voxel_size
+    lidar_range: *cav_lidar
+    anchor_number: *achor_num
+    box_code_size: 7
+    dual_frame: true
+    history_frames: 5
+    freeze_backbone: true
+    pillar_vfe:
+      use_norm: true
+      with_distance: false
+      use_absolute_xyz: true
+      num_point_features: 4
+      num_filters: [64]
+    point_pillar_scatter:
+      num_features: 64
+    base_bev_backbone:
+      layer_nums: [3, 5, 8]
+      layer_strides: [2, 2, 2]
+      num_filters: [64, 128, 256]
+      upsample_strides: [1, 2, 4]
+      num_upsample_filter: [128, 128, 128]
+    anchor_num: *achor_num
+    planning_head:
+      enabled: true
+      type: v2xverse
+      use_velocity_in_planning: false
+      bev_channels: 384
+      feature_dir: 128
+      input_frame: 5
+      num_waypoints: 10
+
+loss:
+  core_method: point_pillar_loss
+  args:
+    cls_weight: 1.0
+    reg: 2.0
+    box_code_size: 7
+    enable_planning: true
+    planning_only: true
+    planning_weight: 1.0
+    planning_loss_type: l1
+
+optimizer:
+  core_method: AdamW
+  lr: 0.0001
+  args:
+    eps: 1.0e-8
+    weight_decay: 0.0005
+
+lr_scheduler:
+  core_method: CosineAnnealingLR
+  T_max: 50
+  eta_min: 1.0e-6

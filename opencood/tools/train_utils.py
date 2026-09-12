@@ -69,13 +69,33 @@ def load_saved_model(saved_path, model):
 def load_pretrained_weights(model, checkpoint_path):
     """
     Load a checkpoint without resuming the training epoch counter.
-    Missing keys (e.g. a newly added planning head) are left randomly init.
+
+    Missing keys (e.g. a newly added planning head) stay randomly initialized.
+    Shape mismatches are skipped the same way: strict=False still raises on
+    them, and a 7D detection backbone must be able to initialize an 8D
+    planner graph whose unused reg_head stays frozen.
     """
     assert os.path.exists(checkpoint_path), \
         '{} not found'.format(checkpoint_path)
     print('loading pretrained weights from %s' % checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+    model_state = model.state_dict()
+    skipped = []
+    filtered = {}
+    for key, value in checkpoint.items():
+        if key not in model_state:
+            filtered[key] = value
+            continue
+        if hasattr(value, 'shape') and value.shape != model_state[key].shape:
+            skipped.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+        filtered[key] = value
+
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    if skipped:
+        print('pretrained load skipped shape mismatches (%d):' % len(skipped))
+        for key, ckpt_shape, model_shape in skipped:
+            print('  - %s ckpt%s != model%s' % (key, ckpt_shape, model_shape))
     if missing:
         print('pretrained load missing keys (%d):' % len(missing))
         for key in missing:
