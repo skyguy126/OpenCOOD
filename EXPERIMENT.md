@@ -28,6 +28,7 @@ test ! -e /home/project/path_v2xverse_det_only_attn && CUDA_VISIBLE_DEVICES=0,1,
 
 | Task | Metric | Value |
 |------|--------|-------|
+| Detection | AP@0.3 | 0.90 |
 | Detection | AP@0.5 | 0.89 |
 | Detection | AP@0.7 | 0.85 |
 | Planning | ADE / FDE | TBD |
@@ -56,6 +57,7 @@ test ! -e /home/project/path_v2xverse_attn && CUDA_VISIBLE_DEVICES=0,1,2 python 
 
 | Task | Metric | Value |
 |------|--------|-------|
+| Detection | AP@0.3 | 0.92 |
 | Detection | AP@0.5 | 0.91 |
 | Detection | AP@0.7 | 0.85 |
 | Velocity | Speed MAE | 0.549 m/s |
