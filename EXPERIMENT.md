@@ -88,6 +88,7 @@ test ! -e /home/project/path_v2xverse_det_only && CUDA_VISIBLE_DEVICES=0 python 
 
 | Task | Metric | Value |
 |------|--------|-------|
+| Detection | AP@0.3 | 0.90 |
 | Detection | AP@0.5 | 0.89 |
 | Detection | AP@0.7 | 0.85 |
 | Planning | ADE / FDE | TBD |
