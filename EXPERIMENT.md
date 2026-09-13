@@ -1,6 +1,6 @@
 # Experiments
 
-Planner change: V2XVerse uniform spatial mean pooling → learned spatial attention pooling (`256 → 64 → 1`, softmax over H×W). Velocity is **not** fed into the planner in either experiment.
+Planner change: V2XVerse uniform spatial mean pooling → learned spatial attention pooling (`256 → 64 → 1`, softmax over H×W). Velocity is **not** fed into the planner in any experiment. Experiment 3 is the original mean-pool baseline.
 
 Env: `conda activate v2xreal`
 
@@ -63,3 +63,31 @@ test ! -e /home/project/path_v2xverse_attn && CUDA_VISIBLE_DEVICES=0,1,2 python 
 | Velocity | Speed MAE | 0.549 m/s |
 | Velocity | Speed RMSE | 0.878 m/s |
 | Planning | ADE / FDE | TBD (attention planner retrain) |
+
+---
+
+# Experiment 3 — Original V2Xverse planner (no-velocity backbone)
+
+Frozen-backbone mean-pool planner (pre-attention V2Xverse head) on the detection-only backbone. Single process on GPU 0; batch 2.
+
+**Backbone**
+```bash
+cd /media/Disk2/OpenCOOD_vamsi_2
+CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_x2_det_only.yaml --model_dir /home/project/x2_detection_only
+```
+
+**Planner**
+```bash
+test ! -e /home/project/path_v2xverse_det_only && CUDA_VISIBLE_DEVICES=0 python opencood/tools/train_v2xverse_mean_planner.py
+```
+
+| | Backbone | Planner |
+|--|----------|---------|
+| Config | `point_pillar_early_fusion_x2_det_only.yaml` | `point_pillar_early_fusion_baseline_det_only_mean.yaml` |
+| Output | `x2_detection_only` | `path_v2xverse_det_only` |
+
+| Task | Metric | Value |
+|------|--------|-------|
+| Detection | AP@0.5 | 0.89 |
+| Detection | AP@0.7 | 0.85 |
+| Planning | ADE / FDE | TBD |
