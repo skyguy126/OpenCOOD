@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 
 import opencood.utils.pcd_utils as pcd_utils
 from opencood.data_utils.augmentor.data_augmentor import DataAugmentor
-from opencood.hypes_yaml.yaml_utils import load_yaml
+from opencood.hypes_yaml.yaml_utils import cached_load_yaml as load_yaml
 from opencood.utils.pcd_utils import downsample_lidar_minimum
 from opencood.utils.transformation_utils import x1_to_x2
 
@@ -274,22 +274,9 @@ class BaseDataset(Dataset):
             # data[cav_id]['lidar_np'] = \
             #     pcd_utils.pcd_to_np(cav_content[timestamp_key_delay]['lidar'])
 
-            # current / delayed params used by normal OpenCOOD pipeline
-            data[cav_id]['params'] = self.reform_param(cav_content,
-                                                    ego_cav_content,
-                                                    timestamp_key,
-                                                    timestamp_key_delay,
-                                                    cur_ego_pose_flag)
-
-            # current / delayed lidar used by normal OpenCOOD pipeline
-            data[cav_id]['lidar_np'] = \
-                pcd_utils.pcd_to_np(cav_content[timestamp_key_delay]['lidar'])
-
-            # ---------------------------------------------------------
-            # Load chronological history LiDAR + params (oldest -> current).
-            # History lids are projected into the *current* ego frame via
-            # reform_param, matching V2Xverse temporal warping intent.
-            # ---------------------------------------------------------
+            # Chronological history (oldest -> current). The last entry is the
+            # delayed current frame, so reuse it instead of reading that PCD
+            # and yaml a second time.
             history_lidar_list = []
             history_params_list = []
             history_timestamp_keys = []
@@ -312,6 +299,15 @@ class BaseDataset(Dataset):
             data[cav_id]['history_lidar_list'] = history_lidar_list
             data[cav_id]['history_params_list'] = history_params_list
             data[cav_id]['history_timestamps'] = history_timestamp_keys
+            if history_timestamp_keys[-1] == timestamp_key_delay:
+                data[cav_id]['params'] = history_params_list[-1]
+                data[cav_id]['lidar_np'] = history_lidar_list[-1]
+            else:
+                data[cav_id]['params'] = self.reform_param(
+                    cav_content, ego_cav_content, timestamp_key,
+                    timestamp_key_delay, cur_ego_pose_flag)
+                data[cav_id]['lidar_np'] = pcd_utils.pcd_to_np(
+                    cav_content[timestamp_key_delay]['lidar'])
 
             # Backward-compatible dual-frame aliases (current + previous).
             prev_timestamp_index = max(0, timestamp_index_delay - 1)
@@ -672,19 +668,26 @@ class BaseDataset(Dataset):
             n_hist = len(batch[0]['ego']['processed_lidar_history'])
             history_by_time = [[] for _ in range(n_hist)]
 
+        planning_only = bool(
+            self.params.get('loss', {}).get('args', {}).get(
+                'planning_only', False))
         for i in range(len(batch)):
             ego_dict = batch[i]['ego']
             object_bbx_center.append(ego_dict['object_bbx_center'])
             object_bbx_mask.append(ego_dict['object_bbx_mask'])
-            processed_lidar_list.append(ego_dict['processed_lidar'])
-            if use_dual_lidar:
-                processed_lidar_prev_list.append(
-                    ego_dict['processed_lidar_prev'])
+            # Planner-only batches still carry history voxels. Current/prev
+            # are the last history frames and are not read by the planner.
+            if not planning_only:
+                processed_lidar_list.append(ego_dict['processed_lidar'])
+                if use_dual_lidar:
+                    processed_lidar_prev_list.append(
+                        ego_dict['processed_lidar_prev'])
             if use_history_lidar:
                 for t, hist_lidar in enumerate(
                         ego_dict['processed_lidar_history']):
                     history_by_time[t].append(hist_lidar)
-            label_dict_list.append(ego_dict['label_dict'])
+            if ego_dict.get('label_dict') is not None:
+                label_dict_list.append(ego_dict['label_dict'])
             if has_future_waypoints:
                 future_waypoints_list.append(ego_dict['future_waypoints'])
             if has_planning_target:
@@ -701,14 +704,17 @@ class BaseDataset(Dataset):
         object_bbx_center = torch.from_numpy(np.array(object_bbx_center))
         object_bbx_mask = torch.from_numpy(np.array(object_bbx_mask))
 
-        processed_lidar_torch_dict = \
-            self.pre_processor.collate_batch(processed_lidar_list)
-        label_torch_dict = \
-            self.post_processor.collate_batch(label_dict_list)
+        if label_dict_list:
+            label_torch_dict = \
+                self.post_processor.collate_batch(label_dict_list)
+        else:
+            label_torch_dict = {}
         output_dict['ego'].update({'object_bbx_center': object_bbx_center,
                                    'object_bbx_mask': object_bbx_mask,
-                                   'processed_lidar': processed_lidar_torch_dict,
                                    'label_dict': label_torch_dict})
+        if processed_lidar_list:
+            output_dict['ego']['processed_lidar'] = \
+                self.pre_processor.collate_batch(processed_lidar_list)
         if has_future_waypoints:
             future_waypoints = \
                 torch.from_numpy(np.array(future_waypoints_list)).float()
@@ -725,7 +731,7 @@ class BaseDataset(Dataset):
                 'history_ego_xy':
                     torch.from_numpy(np.array(history_ego_xy_list)).float(),
             })
-        if use_dual_lidar:
+        if processed_lidar_prev_list:
             processed_lidar_prev_torch_dict = \
                 self.pre_processor.collate_batch(processed_lidar_prev_list)
             output_dict['ego'].update(

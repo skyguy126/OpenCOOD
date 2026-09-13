@@ -11,6 +11,42 @@ import open3d as o3d
 import numpy as np
 
 
+def _pcd_ascii_to_np(pcd_file):
+    """
+    Read an OPV2V-style ASCII PCD (FIELDS x y z rgb) without Open3D.
+
+    Intensity matches Open3D: the rgb float is a packed uint32 and the
+    red byte / 255 is used as the intensity channel.
+    Returns None if the file is not that layout.
+    """
+    with open(pcd_file, 'rb') as handle:
+        fields = None
+        data_type = None
+        while True:
+            line = handle.readline()
+            if not line:
+                return None
+            if line.startswith(b'FIELDS'):
+                fields = line.split()[1:]
+            elif line.startswith(b'DATA'):
+                data_type = line.split()[1].strip().lower()
+                payload = handle.read()
+                break
+    if data_type != b'ascii' or fields != [b'x', b'y', b'z', b'rgb']:
+        return None
+    raw = payload.replace(b'\n', b' ').strip()
+    if not raw:
+        return np.zeros((0, 4), dtype=np.float32)
+    values = np.fromstring(raw, sep=' ', dtype=np.float32)
+    if values.size % 4 != 0:
+        return None
+    values = values.reshape(-1, 4)
+    rgb = values[:, 3].view(np.uint32)
+    intensity = ((rgb >> 16) & 255).astype(np.float32) / 255.0
+    return np.concatenate(
+        (values[:, :3], intensity[:, None]), axis=1).astype(np.float32)
+
+
 def pcd_to_np(pcd_file):
     """
     Read  pcd and return numpy array.
@@ -28,6 +64,10 @@ def pcd_to_np(pcd_file):
         The lidar data in numpy format, shape:(n, 4)
 
     """
+    fast = _pcd_ascii_to_np(pcd_file)
+    if fast is not None:
+        return fast
+
     pcd = o3d.io.read_point_cloud(pcd_file)
 
     xyz = np.asarray(pcd.points)

@@ -7,6 +7,7 @@ import re
 import yaml
 import os
 import math
+from collections import OrderedDict
 
 import numpy as np
 
@@ -47,6 +48,40 @@ def load_yaml(file, opt=None):
         param = eval(param["yaml_parser"])(param)
 
     return param
+
+
+# Scene yamls are re-read many times per sample (history, poses, waypoints).
+# Parsing from disk is the expensive part; callers may mutate the dict, so
+# return a copy of the cached parse.
+_SCENE_YAML_CACHE = OrderedDict()
+_SCENE_YAML_CACHE_MAX = 2048
+
+
+def _copy_scene_yaml(data):
+    """
+    Callers mutate the top-level dict and nested vehicle records.
+    Copy only those, not a full deepcopy of every list.
+    """
+    copied = dict(data)
+    vehicles = data.get('vehicles')
+    if isinstance(vehicles, dict):
+        copied['vehicles'] = {
+            key: dict(value) if isinstance(value, dict) else value
+            for key, value in vehicles.items()
+        }
+    return copied
+
+
+def cached_load_yaml(file):
+    cached = _SCENE_YAML_CACHE.get(file)
+    if cached is None:
+        cached = load_yaml(file)
+        _SCENE_YAML_CACHE[file] = cached
+        if len(_SCENE_YAML_CACHE) > _SCENE_YAML_CACHE_MAX:
+            _SCENE_YAML_CACHE.popitem(last=False)
+    else:
+        _SCENE_YAML_CACHE.move_to_end(file)
+    return _copy_scene_yaml(cached)
 
 
 def load_voxel_params(param):

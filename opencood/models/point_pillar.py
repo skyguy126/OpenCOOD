@@ -89,6 +89,58 @@ class PointPillar(nn.Module):
         batch_dict = self.backbone(batch_dict)
         return batch_dict['spatial_features_2d']
 
+    def encode_history(self, hist_lidars):
+        """
+        Encode T history voxel batches in one backbone pass.
+
+        Each item is a collated batch with the same batch size. Voxel batch
+        indices are offset so time is folded into the batch dimension, then
+        split back to [B, T, C, H, W].
+        """
+        voxel_features = []
+        voxel_coords = []
+        voxel_num_points = []
+        batch_size = None
+        for t, lidar in enumerate(hist_lidars):
+            coords = lidar['voxel_coords']
+            if coords.numel() == 0:
+                b = 1 if batch_size is None else batch_size
+            else:
+                b = int(coords[:, 0].max().item()) + 1
+            if batch_size is None:
+                batch_size = b
+            coords = coords.clone()
+            if coords.numel() > 0:
+                coords[:, 0] = coords[:, 0] + t * batch_size
+            voxel_features.append(lidar['voxel_features'])
+            voxel_coords.append(coords)
+            voxel_num_points.append(lidar['voxel_num_points'])
+
+        merged = {
+            'voxel_features': torch.cat(voxel_features, 0),
+            'voxel_coords': torch.cat(voxel_coords, 0),
+            'voxel_num_points': torch.cat(voxel_num_points, 0),
+        }
+        t_len = len(hist_lidars)
+        if self.freeze_backbone:
+            with torch.no_grad():
+                feat = self.encode_frame(merged)
+        else:
+            feat = self.encode_frame(merged)
+        if feat.shape[0] != t_len * batch_size:
+            # A history frame with no voxels drops a batch index. Fall back
+            # so the time layout stays [B, T, C, H, W].
+            frames = []
+            for lidar in hist_lidars:
+                if self.freeze_backbone:
+                    with torch.no_grad():
+                        frames.append(self.encode_frame(lidar))
+                else:
+                    frames.append(self.encode_frame(lidar))
+            return torch.stack(frames, dim=1)
+        c, h, w = feat.shape[1:]
+        return feat.view(t_len, batch_size, c, h, w).transpose(0, 1).contiguous()
+
     def predicted_speed_bev(self, psm, rm):
         """
         Soft BEV speed map from frozen detection heads.
@@ -254,36 +306,48 @@ class PointPillar(nn.Module):
         return occupancy, target
 
     def forward(self, data_dict):
-        # Detection path: keep existing early-fusion dual-frame temporal fusion.
-        if self.dual_frame:
-            feat_cur = self.encode_frame(data_dict['processed_lidar'])
-            feat_prev = self.encode_frame(data_dict['processed_lidar_prev'])
-            spatial_features_2d = self.temporal_fusion(
-                torch.cat([feat_cur, feat_prev], dim=1))
+        planning_only = bool(getattr(self, 'planning_only', False))
+        # Planner-only training does not use detection heads. Encoding the
+        # current/prev pair on top of the history sequence just doubles work.
+        if not (planning_only and self.use_planning_head):
+            if self.dual_frame:
+                if self.freeze_backbone:
+                    with torch.no_grad():
+                        feat_cur = self.encode_frame(
+                            data_dict['processed_lidar'])
+                        feat_prev = self.encode_frame(
+                            data_dict['processed_lidar_prev'])
+                        spatial_features_2d = self.temporal_fusion(
+                            torch.cat([feat_cur, feat_prev], dim=1))
+                else:
+                    feat_cur = self.encode_frame(data_dict['processed_lidar'])
+                    feat_prev = self.encode_frame(
+                        data_dict['processed_lidar_prev'])
+                    spatial_features_2d = self.temporal_fusion(
+                        torch.cat([feat_cur, feat_prev], dim=1))
+            else:
+                if self.freeze_backbone:
+                    with torch.no_grad():
+                        spatial_features_2d = self.encode_frame(
+                            data_dict['processed_lidar'])
+                else:
+                    spatial_features_2d = self.encode_frame(
+                        data_dict['processed_lidar'])
+
+            if self.freeze_backbone and self.training:
+                spatial_features_2d = spatial_features_2d.detach()
+
+            psm = self.cls_head(spatial_features_2d)
+            rm = self.reg_head(spatial_features_2d)
+            output_dict = {'psm': psm, 'rm': rm}
         else:
-            spatial_features_2d = self.encode_frame(
-                data_dict['processed_lidar'])
-            feat_cur = spatial_features_2d
-
-        if self.freeze_backbone and self.training:
-            spatial_features_2d = spatial_features_2d.detach()
-
-        psm = self.cls_head(spatial_features_2d)
-        rm = self.reg_head(spatial_features_2d)
-
-        output_dict = {'psm': psm,
-                       'rm': rm}
+            output_dict = {}
 
         if self.use_planning_head:
             # Encode five real chronological history frames (oldest -> current).
             if 'processed_lidar_history' in data_dict:
-                hist_feats = []
-                for hist_lidar in data_dict['processed_lidar_history']:
-                    feat_t = self.encode_frame(hist_lidar)
-                    if self.freeze_backbone:
-                        feat_t = feat_t.detach()
-                    hist_feats.append(feat_t)
-                feature_seq = torch.stack(hist_feats, dim=1)  # [B, T, C, H, W]
+                feature_seq = self.encode_history(
+                    data_dict['processed_lidar_history'])
             elif self.dual_frame:
                 # Should not happen for the planning baseline; fail loudly.
                 raise RuntimeError(

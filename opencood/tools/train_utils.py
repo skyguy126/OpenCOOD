@@ -419,6 +419,98 @@ def dataloader_kwargs(train_params, distributed=False, shuffle=True,
     return kwargs
 
 
+def parse_cpu_spec(spec):
+    """Parse '0-3,8,10-11' into a sorted unique list of CPU ids."""
+    cpus = []
+    if not spec:
+        return cpus
+    for part in str(spec).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            start, end = part.split('-', 1)
+            cpus.extend(range(int(start), int(end) + 1))
+        else:
+            cpus.append(int(part))
+    return sorted(set(cpus))
+
+
+def _thread_siblings(cpu):
+    path = '/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list' % cpu
+    try:
+        with open(path, 'r') as handle:
+            return parse_cpu_spec(handle.read().strip())
+    except OSError:
+        return [cpu]
+
+
+def cpu_core_groups(spec):
+    """
+    Group a CPU spec into physical cores, including the HT sibling so a
+    pinned process is not preempted off its L1/L2 by the sibling thread.
+    """
+    requested = parse_cpu_spec(spec)
+    groups = []
+    seen = set()
+    for cpu in requested:
+        if cpu in seen:
+            continue
+        # Include the HT sibling even if the caller listed only the
+        # physical core, so another job cannot sit on the same L1/L2.
+        group = sorted(set(_thread_siblings(cpu)))
+        groups.append(group)
+        seen.update(group)
+    return groups
+
+
+def _limit_blas_threads():
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    os.environ['NUMEXPR_NUM_THREADS'] = '1'
+    try:
+        import torch
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
+
+def apply_cpu_affinity(cpus, label=''):
+    os.sched_setaffinity(0, set(cpus))
+    if label:
+        print('%s pinned to CPUs %s' % (
+            label, ','.join(str(cpu) for cpu in sorted(cpus))))
+
+
+def bind_job_affinity(spec, num_workers):
+    """
+    Pin this process to the first physical core and return a DataLoader
+    worker_init_fn that pins each worker to its own core.
+
+    spec is a physical-core list such as '12-19'. Hyperthread siblings are
+    attached automatically so another job cannot sit on the same core.
+    """
+    groups = cpu_core_groups(spec)
+    if not groups:
+        raise ValueError('cpu_affinity %r did not match any CPUs' % spec)
+    _limit_blas_threads()
+    apply_cpu_affinity(groups[0], label='main process')
+    worker_groups = groups[1:] or groups
+
+    def _init(worker_id):
+        _limit_blas_threads()
+        group = worker_groups[worker_id % len(worker_groups)]
+        apply_cpu_affinity(group, label='dataloader worker %d' % worker_id)
+
+    print('CPU affinity: %d core(s) for workers, main on %s'
+          % (len(worker_groups), groups[0]))
+    if num_workers > len(worker_groups):
+        print('Warning: %d workers share %d cores'
+              % (num_workers, len(worker_groups)))
+    return _init
+
+
 def save_best_checkpoint(model, saved_path, epoch, metric_name, metric_value):
     """
     Persist best-so-far weights plus a small sidecar for resume/reporting.

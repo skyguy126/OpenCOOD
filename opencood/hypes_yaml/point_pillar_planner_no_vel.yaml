@@ -17,11 +17,11 @@ train_params:
   pretrained_dir: "/home/project/x2_detection_only"
   pretrained_epoch: 15
   gradient_clip_norm: 10
-  num_workers: 4
+  num_workers: 8
   val_num_workers: 2
   pin_memory: true
-  prefetch_factor: 2
-  persistent_workers: false
+  prefetch_factor: 4
+  persistent_workers: true
   val_persistent_workers: false
   max_workers_per_rank_train: 4
   max_workers_per_rank_val: 2

@@ -17,11 +17,22 @@ from opencood.utils import box_utils
 from opencood.data_utils.post_processor import build_postprocessor
 from opencood.data_utils.datasets import basedataset
 from opencood.data_utils.pre_processor import build_preprocessor
-from opencood.hypes_yaml.yaml_utils import load_yaml
+from opencood.hypes_yaml.yaml_utils import cached_load_yaml as load_yaml
 from opencood.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 from opencood.utils.transformation_utils import x1_to_x2, x_to_world
+
+
+def _project_points_numpy(points, transformation_matrix):
+    """Same result as project_points_by_matrix_torch, without a torch copy."""
+    if points.size == 0:
+        return points.reshape(0, 3)
+    ones = np.ones((points.shape[0], 1), dtype=np.float32)
+    homo = np.concatenate((points.astype(np.float32, copy=False), ones), axis=1)
+    projected = homo @ np.asarray(
+        transformation_matrix, dtype=np.float32).T
+    return projected[:, :3]
 
 
 def world_xy_to_ego(xy, ego_pose):
@@ -63,6 +74,8 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         planning_args = params.get('model', {}).get('args', {}).get(
             'planning_head', {})
         self.planning_enabled = planning_args.get('enabled', False)
+        self.planning_only = bool(
+            params.get('loss', {}).get('args', {}).get('planning_only', False))
         self.num_future_waypoints = planning_args.get('num_waypoints', 10)
         self.input_frame = int(
             params.get('model', {}).get('args', {}).get(
@@ -307,14 +320,31 @@ class EarlyFusionDataset(basedataset.BaseDataset):
                 projected_lidar_history[-2] = projected_lidar_prev_stack
 
         cav_lidar_range = self.params['preprocess']['cav_lidar_range']
-        projected_lidar_stack = mask_points_by_range(projected_lidar_stack,
-                                                     cav_lidar_range)
-        projected_lidar_prev_stack = mask_points_by_range(
-            projected_lidar_prev_stack, cav_lidar_range)
-        projected_lidar_history = [
-            mask_points_by_range(pc, cav_lidar_range)
-            for pc in projected_lidar_history
-        ]
+        no_augment = len(self.data_augmentor.data_augmentor_queue) == 0
+        if no_augment and projected_lidar_history:
+            # Last history slots were filled with the already-projected
+            # current/prev clouds. Mask and voxelize each cloud once.
+            projected_lidar_history[-1] = projected_lidar_stack
+            if len(projected_lidar_history) >= 2:
+                projected_lidar_history[-2] = projected_lidar_prev_stack
+            projected_lidar_history = [
+                mask_points_by_range(pc, cav_lidar_range)
+                for pc in projected_lidar_history
+            ]
+            projected_lidar_stack = projected_lidar_history[-1]
+            projected_lidar_prev_stack = (
+                projected_lidar_history[-2]
+                if len(projected_lidar_history) >= 2
+                else projected_lidar_history[-1])
+        else:
+            projected_lidar_stack = mask_points_by_range(
+                projected_lidar_stack, cav_lidar_range)
+            projected_lidar_prev_stack = mask_points_by_range(
+                projected_lidar_prev_stack, cav_lidar_range)
+            projected_lidar_history = [
+                mask_points_by_range(pc, cav_lidar_range)
+                for pc in projected_lidar_history
+            ]
 
         object_bbx_center_valid = object_bbx_center[mask == 1]
 
@@ -340,21 +370,35 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         object_bbx_center[object_bbx_center_valid.shape[0]:] = 0
         unique_indices = list(np.array(unique_indices)[range_mask])
 
-        # pre-process current, previous, and full history lidars
-        lidar_dict = self.pre_processor.preprocess(projected_lidar_stack)
-        lidar_prev_dict = self.pre_processor.preprocess(
-            projected_lidar_prev_stack)
-        lidar_history_dicts = [
-            self.pre_processor.preprocess(pc)
-            for pc in projected_lidar_history
-        ]
+        # Voxelize each unique cloud once. With augment off, current/prev
+        # are the last history frames, so don't voxelize them again.
+        if no_augment and projected_lidar_history:
+            lidar_history_dicts = [
+                self.pre_processor.preprocess(pc)
+                for pc in projected_lidar_history
+            ]
+            lidar_dict = lidar_history_dicts[-1]
+            lidar_prev_dict = (
+                lidar_history_dicts[-2]
+                if len(lidar_history_dicts) >= 2
+                else lidar_history_dicts[-1])
+        else:
+            lidar_dict = self.pre_processor.preprocess(projected_lidar_stack)
+            lidar_prev_dict = self.pre_processor.preprocess(
+                projected_lidar_prev_stack)
+            lidar_history_dicts = [
+                self.pre_processor.preprocess(pc)
+                for pc in projected_lidar_history
+            ]
 
-        # generate the anchor boxes
-        anchor_box = self.post_processor.generate_anchor_box()
-
-        # generate targets label
-        label_dict = \
-            self.post_processor.generate_label(
+        # Planner-only training never reads detection targets. Anchor matching
+        # is a large per-sample CPU cost, so skip it.
+        if self.planning_only:
+            anchor_box = None
+            label_dict = None
+        else:
+            anchor_box = self.post_processor.generate_anchor_box()
+            label_dict = self.post_processor.generate_label(
                 gt_box_center=object_bbx_center,
                 anchors=anchor_box,
                 mask=mask)
@@ -403,25 +447,31 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             x1_to_x2(selected_cav_base['params']['lidar_pose'],
                      ego_pose)
 
-        object_bbx_center, object_bbx_mask, object_ids = \
-            self.post_processor.generate_object_center([selected_cav_base], ego_pose)
+        if self.planning_only:
+            # Occupancy comes from history poses, not detection boxes.
+            valid_object_bbx_center = np.zeros((0, 8), dtype=np.float32)
+            object_ids = []
+        else:
+            object_bbx_center, object_bbx_mask, object_ids = \
+                self.post_processor.generate_object_center(
+                    [selected_cav_base], ego_pose)
 
-        valid_object_bbx_center = object_bbx_center[object_bbx_mask == 1]
+            valid_object_bbx_center = object_bbx_center[object_bbx_mask == 1]
 
-        vehicles = selected_cav_base['params']['vehicles']
+            vehicles = selected_cav_base['params']['vehicles']
 
-        speed_list = []
-        for obj_id in object_ids:
-            speed = get_speed_by_object_id(vehicles, obj_id) #TODO
-            speed_list.append(speed)
+            speed_list = []
+            for obj_id in object_ids:
+                speed = get_speed_by_object_id(vehicles, obj_id) #TODO
+                speed_list.append(speed)
 
-        speed_array = np.array(speed_list, dtype=np.float32).reshape(-1, 1)
+            speed_array = np.array(speed_list, dtype=np.float32).reshape(-1, 1)
 
-        # shape: (num_objects, 8)
-        valid_object_bbx_center = np.concatenate(
-            [valid_object_bbx_center, speed_array],
-            axis=1
-        )
+            # shape: (num_objects, 8)
+            valid_object_bbx_center = np.concatenate(
+                [valid_object_bbx_center, speed_array],
+                axis=1
+            )
 
         # -----------------------------
         # Current frame LiDAR
@@ -430,11 +480,8 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         lidar_np = shuffle_points(lidar_np)
         lidar_np = mask_ego_points(lidar_np)
 
-        lidar_np[:, :3] = \
-            box_utils.project_points_by_matrix_torch(
-                lidar_np[:, :3],
-                transformation_matrix
-            )
+        lidar_np[:, :3] = _project_points_numpy(
+            lidar_np[:, :3], transformation_matrix)
 
         lidar_np = lidar_np.astype(np.float32)
 
@@ -448,11 +495,8 @@ class EarlyFusionDataset(basedataset.BaseDataset):
         prev_transformation_matrix = \
             selected_cav_base['prev_params']['transformation_matrix']
 
-        prev_lidar_np[:, :3] = \
-            box_utils.project_points_by_matrix_torch(
-                prev_lidar_np[:, :3],
-                prev_transformation_matrix
-            )
+        prev_lidar_np[:, :3] = _project_points_numpy(
+            prev_lidar_np[:, :3], prev_transformation_matrix)
         prev_lidar_np = prev_lidar_np.astype(np.float32)
 
         # -----------------------------
@@ -463,12 +507,22 @@ class EarlyFusionDataset(basedataset.BaseDataset):
             'history_lidar_list', [lidar_np])
         history_params_list = selected_cav_base.get(
             'history_params_list', [selected_cav_base['params']])
-        for hist_lidar, hist_params in zip(
-                history_lidar_list, history_params_list):
+        # Current and previous are written over the last history slots when
+        # augmentation is off, so don't project those clouds twice.
+        n_hist = len(history_lidar_list)
+        skip_tail = 0
+        if len(self.data_augmentor.data_augmentor_queue) == 0:
+            skip_tail = min(2, n_hist)
+        for i, (hist_lidar, hist_params) in enumerate(zip(
+                history_lidar_list, history_params_list)):
+            if i >= n_hist - skip_tail:
+                projected_lidar_history.append(
+                    np.zeros((0, 4), dtype=np.float32))
+                continue
             hist_pc = shuffle_points(hist_lidar.copy())
             hist_pc = mask_ego_points(hist_pc)
             hist_T = hist_params['transformation_matrix']
-            hist_pc[:, :3] = box_utils.project_points_by_matrix_torch(
+            hist_pc[:, :3] = _project_points_numpy(
                 hist_pc[:, :3], hist_T)
             projected_lidar_history.append(hist_pc.astype(np.float32))
 

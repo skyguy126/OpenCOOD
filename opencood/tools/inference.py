@@ -46,6 +46,9 @@ def test_parser():
                         help='whether to globally sort detections by confidence score.'
                              'If set to True, it is the mainstream AP computing method,'
                              'but would increase the tolerance for FP (False Positives).')
+    parser.add_argument('--cpu_affinity', default='',
+                        help='Physical cores for this job, e.g. 0-11. '
+                             'HT siblings are reserved automatically.')
     opt = parser.parse_args()
     return opt
 
@@ -73,6 +76,9 @@ def main():
     if loader_kwargs["num_workers"] > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 4
+    if opt.cpu_affinity:
+        loader_kwargs["worker_init_fn"] = train_utils.bind_job_affinity(
+            opt.cpu_affinity, loader_kwargs["num_workers"])
     data_loader = DataLoader(opencood_dataset, **loader_kwargs)
 
     print('Creating Model')

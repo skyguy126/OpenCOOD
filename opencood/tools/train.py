@@ -42,6 +42,11 @@ def train_parser():
                         help="whether train with half precision.")
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
+    parser.add_argument('--cpu_affinity', default='',
+                        help='Physical cores for this job, e.g. 12-19. '
+                             'HT siblings are reserved automatically. '
+                             'Main process gets the first core; each '
+                             'DataLoader worker gets its own.')
     opt = parser.parse_args()
     return opt
 
@@ -126,6 +131,11 @@ def main():
         train_params, distributed=opt.distributed, shuffle=False,
         drop_last=False, is_train=False)
     loader_val_kwargs['drop_last'] = False
+    if opt.cpu_affinity:
+        worker_init = train_utils.bind_job_affinity(
+            opt.cpu_affinity, loader_train_kwargs.get('num_workers', 0))
+        loader_train_kwargs['worker_init_fn'] = worker_init
+        loader_val_kwargs['worker_init_fn'] = worker_init
 
     if opt.distributed:
         sampler_train = DistributedSampler(opencood_train_dataset)
@@ -189,6 +199,7 @@ def main():
 
     print('---------------Creating Model------------------')
     model = train_utils.create_model(hypes)
+    model.planning_only = planning_only
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     init_epoch = 0
