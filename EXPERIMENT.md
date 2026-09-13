@@ -8,7 +8,7 @@ Env: `conda activate v2xreal`
 
 # Experiment 1 — Backbone without velocity
 
-Detection-only dual-frame backbone (training), then frozen-backbone attention planner (to retrain).
+Detection-only dual-frame backbone (done), then frozen-backbone attention planner (to retrain).
 
 **Backbone**
 ```bash
@@ -28,8 +28,8 @@ test ! -e /home/project/path_v2xverse_det_only_attn && CUDA_VISIBLE_DEVICES=0,1,
 
 | Task | Metric | Value |
 |------|--------|-------|
-| Detection | AP@0.5 | TBD |
-| Detection | AP@0.7 | TBD |
+| Detection | AP@0.5 | 0.89 |
+| Detection | AP@0.7 | 0.85 |
 | Planning | ADE / FDE | TBD |
 
 ---
