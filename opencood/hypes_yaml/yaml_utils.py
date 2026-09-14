@@ -12,6 +12,23 @@ from collections import OrderedDict
 import numpy as np
 
 
+# OpenCOOD needs this resolver for scientific-notation floats. Register it
+# once: yaml.Loader.add_implicit_resolver appends, and calling it on every
+# file makes each later parse walk a longer regex list. With persistent
+# DataLoader workers that cost grows for the life of the process.
+_FLOAT_RESOLVER_RE = re.compile(u'''^(?:
+         [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+        |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+        |\\.[0-9_]+(?:[eE][-+][0-9]+)?
+        |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
+        |[-+]?\\.(?:inf|Inf|INF)
+        |\\.(?:nan|NaN|NAN))$''', re.X)
+yaml.Loader.add_implicit_resolver(
+    u'tag:yaml.org,2002:float',
+    _FLOAT_RESOLVER_RE,
+    list(u'-+0123456789.'))
+
+
 def load_yaml(file, opt=None):
     """
     Load yaml file and return a dictionary.
@@ -31,19 +48,8 @@ def load_yaml(file, opt=None):
     if opt and opt.model_dir:
         file = os.path.join(opt.model_dir, 'config.yaml')
 
-    stream = open(file, 'r')
-    loader = yaml.Loader
-    loader.add_implicit_resolver(
-        u'tag:yaml.org,2002:float',
-        re.compile(u'''^(?:
-         [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
-        |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
-        |\\.[0-9_]+(?:[eE][-+][0-9]+)?
-        |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
-        |[-+]?\\.(?:inf|Inf|INF)
-        |\\.(?:nan|NaN|NAN))$''', re.X),
-        list(u'-+0123456789.'))
-    param = yaml.load(stream, Loader=loader)
+    with open(file, 'r') as stream:
+        param = yaml.load(stream, Loader=yaml.Loader)
     if "yaml_parser" in param:
         param = eval(param["yaml_parser"])(param)
 

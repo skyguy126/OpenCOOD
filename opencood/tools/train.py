@@ -11,6 +11,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import argparse
+import glob
 import statistics
 
 import torch
@@ -51,11 +52,28 @@ def train_parser():
     return opt
 
 
+def _model_dir_has_checkpoint(model_dir):
+    """True if this run already saved a planner checkpoint to resume from."""
+    if not model_dir or not os.path.isdir(model_dir):
+        return False
+    if os.path.exists(os.path.join(model_dir, 'latest.pth')):
+        return True
+    return bool(glob.glob(os.path.join(model_dir, 'net_epoch*.pth')))
+
+
 def main():
     opt = train_parser()
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, None)
     train_params = hypes.get('train_params', {})
     pretrained_dir = opt.pretrained_dir or train_params.get('pretrained_dir', '')
+    # Same launch command is reused after a restart. If planner checkpoints
+    # already exist, resume them. Otherwise --pretrained_dir (also stored in
+    # the yaml) reloads the detection backbone and restarts the planner at 0.
+    resume_existing = _model_dir_has_checkpoint(opt.model_dir)
+    if resume_existing and pretrained_dir:
+        print('Found planner checkpoints in %s; resuming that run and '
+              'ignoring pretrained_dir=%s' % (opt.model_dir, pretrained_dir))
+        pretrained_dir = ''
 
     # Resume an existing run (uses model_dir/config.yaml).
     # Overlay DataLoader / eval schedule keys from the explicitly passed
@@ -77,6 +95,8 @@ def main():
         hypes['train_params'] = train_params
 
     pretrained_dir = opt.pretrained_dir or train_params.get('pretrained_dir', '')
+    if resume_existing:
+        pretrained_dir = ''
     freeze_backbone = train_params.get('freeze_backbone', False)
     gradient_clip_norm = train_params.get('gradient_clip_norm', None)
 
@@ -225,10 +245,9 @@ def main():
         else:
             saved_path = train_utils.setup_train(hypes)
     elif opt.model_dir:
-        # Resume: load full checkpoint (backbone + planner). Detection/speed
-        # weights are already in net_epoch*.pth from the earlier pretrained
-        # init — do not pass --pretrained_dir or training restarts at epoch 0
-        # with a randomly initialized planner.
+        # Resume: load full checkpoint (backbone + planner). If this directory
+        # already has net_epoch*.pth, pretrained_dir was ignored above so a
+        # restarted launch command does not reinit the planner.
         saved_path = opt.model_dir
         if not os.path.exists(saved_path):
             os.makedirs(saved_path)
@@ -238,6 +257,10 @@ def main():
         init_epoch, model = train_utils.load_saved_model(saved_path, model)
         if freeze_backbone:
             model = train_utils.freeze_backbone(model)
+        if resume_existing and init_epoch == 0:
+            raise RuntimeError(
+                'model_dir %s looked like an existing run but no '
+                'net_epoch*.pth could be loaded' % saved_path)
     else:
         saved_path = train_utils.setup_train(hypes)
 

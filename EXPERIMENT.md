@@ -68,7 +68,7 @@ test ! -e /home/project/path_v2xverse_attn && CUDA_VISIBLE_DEVICES=0,1,2 python 
 
 # Experiment 3 — Original V2Xverse planner (no-velocity backbone)
 
-Frozen-backbone mean-pool planner (pre-attention V2Xverse head) on the detection-only backbone. Single process on GPU 0; batch 2.
+Frozen-backbone mean-pool planner (pre-attention V2Xverse head) on the detection-only backbone. Single process on GPU 0; batch 2. CPU affinity `0-11,40-51` (GPU 0 NUMA, clear of the other jobs).
 
 **Backbone**
 ```bash
