@@ -588,9 +588,12 @@ class EarlyFusionDataset(basedataset.BaseDataset):
                     self.pre_processor.collate_batch([hist])
                     for hist in cav_content['processed_lidar_history']
                 ]
-            # label dictionary
-            label_torch_dict = \
-                self.post_processor.collate_batch([cav_content['label_dict']])
+            # Planner-only runs leave label_dict as None (same as train collate).
+            if cav_content.get('label_dict') is not None:
+                label_torch_dict = self.post_processor.collate_batch(
+                    [cav_content['label_dict']])
+            else:
+                label_torch_dict = {}
 
             # planning GT (only exists for the ego vehicle)
             planning_fields = {}
