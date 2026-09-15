@@ -8,7 +8,7 @@ Env: `conda activate v2xreal`
 
 # Experiment 1 — Backbone without velocity
 
-Detection-only dual-frame backbone (done), then frozen-backbone attention planner (**TODO: training in progress**).
+Detection-only dual-frame backbone (done), then frozen-backbone attention planner (done, epoch 50).
 
 **Backbone**
 ```bash
@@ -31,13 +31,13 @@ test ! -e /home/project/path_v2xverse_det_only_attn && CUDA_VISIBLE_DEVICES=0,1,
 | Detection | AP@0.3 | 0.90 |
 | Detection | AP@0.5 | 0.89 |
 | Detection | AP@0.7 | 0.85 |
-| Planning | ADE / FDE | TBD |
+| Planning | ADE / FDE | 0.7655 / 1.6115 |
 
 ---
 
 # Experiment 2 — Backbone with velocity
 
-Det+velocity dual-frame backbone (done), then frozen-backbone attention planner (**TODO: training in progress**).
+Det+velocity dual-frame backbone (done), then frozen-backbone attention planner (done, epoch 50).
 
 **Backbone**
 ```bash
@@ -62,7 +62,7 @@ test ! -e /home/project/path_v2xverse_attn && CUDA_VISIBLE_DEVICES=0,1,2 python 
 | Detection | AP@0.7 | 0.85 |
 | Velocity | Speed MAE | 0.549 m/s |
 | Velocity | Speed RMSE | 0.878 m/s |
-| Planning | ADE / FDE | TBD (attention planner retrain) |
+| Planning | ADE / FDE | 0.6522 / 1.4261 |
 
 ---
 
@@ -91,4 +91,4 @@ test ! -e /home/project/path_v2xverse_det_only && CUDA_VISIBLE_DEVICES=0 python 
 | Detection | AP@0.3 | 0.90 |
 | Detection | AP@0.5 | 0.89 |
 | Detection | AP@0.7 | 0.85 |
-| Planning | ADE / FDE | TBD |
+| Planning | ADE / FDE | 0.5919 / 1.2634 |
