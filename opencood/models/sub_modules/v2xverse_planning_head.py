@@ -125,6 +125,10 @@ class V2XVersePlanningHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 1, kernel_size=1),
         )
+        # Zero-init final scorer so logits start at 0 → uniform softmax ≈ mean
+        # pooling; attention only departs from the V2XVerse baseline when useful.
+        nn.init.zeros_(self.spatial_attn[-1].weight)
+        nn.init.zeros_(self.spatial_attn[-1].bias)
 
         self.decoder = MLP(256 + 128, 20, hid_feat=(1025, 512))
         self.target_encoder = MLP(2, 128, hid_feat=(16, 64))

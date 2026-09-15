@@ -490,10 +490,26 @@ def bind_job_affinity(spec, num_workers):
 
     spec is a physical-core list such as '12-19'. Hyperthread siblings are
     attached automatically so another job cannot sit on the same core.
+
+    Under torch.distributed (LOCAL_WORLD_SIZE > 1), physical cores in spec
+    are split into contiguous chunks so each LOCAL_RANK gets a disjoint set.
     """
     groups = cpu_core_groups(spec)
     if not groups:
         raise ValueError('cpu_affinity %r did not match any CPUs' % spec)
+
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    local_world = int(os.environ.get(
+        'LOCAL_WORLD_SIZE', os.environ.get('WORLD_SIZE', '1')))
+    if local_world > 1 and len(groups) >= local_world:
+        chunk = len(groups) // local_world
+        start = local_rank * chunk
+        end = len(groups) if local_rank == local_world - 1 else start + chunk
+        groups = groups[start:end]
+        print('CPU affinity: LOCAL_RANK %d/%d using physical cores %s'
+              % (local_rank, local_world,
+                 ','.join(str(g[0]) for g in groups)))
+
     _limit_blas_threads()
     apply_cpu_affinity(groups[0], label='main process')
     worker_groups = groups[1:] or groups
