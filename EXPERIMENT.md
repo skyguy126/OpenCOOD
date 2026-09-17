@@ -4,12 +4,15 @@ Ablation for velocity-conditioned planning: **baseline planner** = V2XVerse unif
 
 Env: `conda activate v2xreal`
 
-| ID | Backbone | Planner | Velocity in occupancy | ADE / FDE |
-|----|----------|---------|----------------------|-----------|
-| 1 | detection only backbone | baseline planner | no | 0.5919 / 1.2634 |
-| 2 | velocity backbone | baseline planner | no | 0.6403 / 1.3899 |
-| 3 | velocity backbone | baseline planner | yes | TODO |
-| 4 | velocity backbone | attention planner | yes | 1.3394 / 2.4652 |
+| ID | Backbone | Planner | ADE / FDE |
+|----|----------|---------|-----------|
+| 1 | detection only backbone | baseline planner (mean pool; no speed channel) | 0.5919 / 1.2634 |
+| 2 | velocity backbone | baseline planner (mean pool; **no** speed channel) | 0.6403 / 1.3899 |
+| 3 | velocity backbone | baseline planner (mean pool; **with** speed channel) | TODO |
+| 4 | velocity backbone | attention planner (spatial attn; **with** speed channel) | 1.3394 / 2.4652 |
+
+Rows 2–4 share the same frozen velocity backbone (`x2_multiframe`). They differ only in the planner head: mean vs attention, and whether predicted speed is occupancy channel 6.
+
 
 ---
 
