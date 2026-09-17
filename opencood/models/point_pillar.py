@@ -14,6 +14,36 @@ from opencood.models.sub_modules.base_bev_backbone import BaseBEVBackbone
 from opencood.models.sub_modules.v2xverse_planning_head import V2XVersePlanningHead
 
 
+# Planner occupancy channel counts are derived from motion_mode only.
+MOTION_MODE_CHANNELS = {
+    'none': 6,
+    'gated_speed': 7,
+    'confidence_gated_speed': 8,
+}
+
+
+def resolve_motion_mode(planning_args):
+    """
+    Resolve planner motion_mode from YAML.
+
+    Prefer explicit motion_mode. Legacy use_velocity_in_planning maps to
+    gated_speed (confidence * best-anchor speed, no confidence normalization).
+    """
+    if planning_args is None:
+        planning_args = {}
+    motion_mode = planning_args.get('motion_mode', None)
+    if motion_mode is None:
+        if bool(planning_args.get('use_velocity_in_planning', False)):
+            motion_mode = 'gated_speed'
+        else:
+            motion_mode = 'none'
+    if motion_mode not in MOTION_MODE_CHANNELS:
+        raise ValueError(
+            "planning_head.motion_mode must be one of %s, got %r"
+            % (sorted(MOTION_MODE_CHANNELS), motion_mode))
+    return motion_mode
+
+
 class PointPillar(nn.Module):
     def __init__(self, args):
         super(PointPillar, self).__init__()
@@ -27,11 +57,14 @@ class PointPillar(nn.Module):
         bev_channels = 128 * 3
         planning_args = args.get('planning_head', {})
         self.use_planning_head = planning_args.get('enabled', False)
-        self.use_velocity_in_planning = bool(
-            planning_args.get('use_velocity_in_planning', False))
+        self.motion_mode = resolve_motion_mode(planning_args)
+        self.occupancy_channels = MOTION_MODE_CHANNELS[self.motion_mode]
+        # Legacy alias: any non-none motion mode injects motion into occupancy.
+        self.use_velocity_in_planning = self.motion_mode != 'none'
         self.input_frame = int(planning_args.get(
             'input_frame', args.get('history_frames', 5)))
-        self.occupancy_channels = 7 if self.use_velocity_in_planning else 6
+        # Default pooling for this class historically replaced mean with attention.
+        self.planner_pooling = planning_args.get('pooling', 'attention')
 
         # PIllar VFE
         self.pillar_vfe = PillarVFE(
@@ -77,6 +110,7 @@ class PointPillar(nn.Module):
                 input_frame=self.input_frame,
                 output_points=planning_args.get('num_waypoints', 10),
                 occupancy_channels=self.occupancy_channels,
+                pooling=self.planner_pooling,
             )
 
     def encode_frame(self, processed_lidar):
@@ -141,30 +175,47 @@ class PointPillar(nn.Module):
         c, h, w = feat.shape[1:]
         return feat.view(t_len, batch_size, c, h, w).transpose(0, 1).contiguous()
 
-    def predicted_speed_bev(self, psm, rm):
+    def predicted_motion_bev(self, psm, rm):
         """
-        Soft BEV speed map from frozen detection heads.
+        Confidence-aware motion maps from frozen detection heads.
+
+        For each BEV cell, take the highest-confidence anchor's objectness and
+        its predicted speed, then form gated_speed = confidence * speed.
+        Background cells stay near zero because confidence is low; there is
+        NO division by summed confidence (that would amplify unsupervised
+        background regression values).
 
         psm: [B, A, H, W], rm: [B, A * box_code_size, H, W]
-        Returns normalized speed in roughly [0, 1+] as [B, 1, H, W].
+        Returns:
+            confidence: [B, 1, H, W] in approximately [0, 1]
+            gated_speed: [B, 1, H, W] (confidence * clamped best-anchor speed)
         """
         assert self.box_code_size >= 8, (
-            "predicted speed requires box_code_size >= 8")
+            "predicted motion requires box_code_size >= 8")
         b, a, h, w = psm.shape
         rm = rm.view(b, a, self.box_code_size, h, w)
         # Network regresses speed / speed_norm (see VoxelPostprocessor).
-        speed_normed = rm[:, :, 7, :, :]
+        speed = rm[:, :, 7]
         scores = torch.sigmoid(psm)
-        denom = scores.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        vel = (scores * speed_normed).sum(dim=1, keepdim=True) / denom
-        return vel.clamp(0.0, 2.0)
+        confidence, best_anchor = scores.max(dim=1, keepdim=True)
+        best_speed = speed.gather(1, best_anchor)
+        best_speed = best_speed.clamp(0.0, 2.0)
+        gated_speed = confidence * best_speed
 
-    def history_predicted_velocity_maps(self, hist_feats):
+        assert torch.isfinite(confidence).all(), "confidence has non-finite values"
+        assert torch.isfinite(gated_speed).all(), "gated_speed has non-finite values"
+        return confidence, gated_speed
+
+    def history_predicted_motion_maps(self, hist_feats):
         """
-        Per-history-frame predicted velocity BEV maps [B, T, 1, H, W].
+        Per-history-frame confidence and gated-speed BEV maps.
+
+        Returns:
+            confidence: [B, T, 1, H, W]
+            gated_speed: [B, T, 1, H, W]
 
         Uses the same dual-frame temporal fusion + cls/reg heads as detection
-        so the planner consumes the course-project velocity prediction, not GT.
+        so the planner consumes frozen detector predictions, not GT.
         Batched over time to avoid serial GPU launches.
         """
         b, t_len, c, h, w = hist_feats.shape
@@ -181,11 +232,26 @@ class PointPillar(nn.Module):
             fused = fused.detach()
         psm_t = self.cls_head(fused)
         rm_t = self.reg_head(fused)
-        vel = self.predicted_speed_bev(psm_t, rm_t)
-        return vel.view(b, t_len, 1, h, w)
+        confidence, gated_speed = self.predicted_motion_bev(psm_t, rm_t)
+        return (
+            confidence.view(b, t_len, 1, h, w),
+            gated_speed.view(b, t_len, 1, h, w),
+        )
+
+    @staticmethod
+    def _resize_motion_map(motion_map, batch_size, t_len, h, w):
+        """Bilinear-resize a [B,T,1,H',W'] motion map to planner (H, W)."""
+        if motion_map.shape[-2:] == (h, w):
+            return motion_map
+        flat = motion_map.view(
+            batch_size * t_len, 1,
+            motion_map.shape[-2], motion_map.shape[-1])
+        flat = F.interpolate(
+            flat, size=(h, w), mode='bilinear', align_corners=False)
+        return flat.view(batch_size, t_len, 1, h, w)
 
     def build_v2xverse_occupancy(self, data_dict, h, w, device,
-                                 velocity_maps=None):
+                                 confidence_maps=None, gated_speed_maps=None):
         """
         Build V2Xverse-style occupancy [B, T, C, H, W] and target [B, 2].
 
@@ -196,7 +262,13 @@ class PointPillar(nn.Module):
           3: metric x coordinate map
           4: metric y coordinate map
           5: drivable-area / road map (zeros on OPV2V; no birdview)
-          6: (optional) predicted actor speed BEV map from detection head
+
+        Extra channels are controlled by motion_mode (not inferred from C):
+          gated_speed (C=7):
+            6: confidence * predicted_speed
+          confidence_gated_speed (C=8):
+            6: detector confidence / objectness
+            7: confidence * predicted_speed
 
         Target is `planning_target` (route command), never a future waypoint.
         """
@@ -211,7 +283,10 @@ class PointPillar(nn.Module):
         batch_size = target.shape[0]
         t_len = self.input_frame
         x_min, y_min, _, x_max, y_max, _ = self.lidar_range
-        n_ch = self.occupancy_channels
+        n_ch = MOTION_MODE_CHANNELS[self.motion_mode]
+        assert n_ch == self.occupancy_channels, (
+            "occupancy_channels (%d) disagrees with motion_mode %r (-> %d)"
+            % (self.occupancy_channels, self.motion_mode, n_ch))
 
         occupancy = torch.zeros(
             batch_size, t_len, n_ch, h, w, device=device, dtype=torch.float32)
@@ -288,20 +363,43 @@ class PointPillar(nn.Module):
         occupancy[:, :, 3:4] = xs.expand(batch_size, t_len, 1, h, w)
         occupancy[:, :, 4:5] = ys.expand(batch_size, t_len, 1, h, w)
 
-        if self.use_velocity_in_planning:
-            assert velocity_maps is not None, (
-                "use_velocity_in_planning requires velocity_maps")
-            assert velocity_maps.shape[:2] == (batch_size, t_len), (
-                "velocity_maps shape %s does not match occupancy batch/time"
-                % (tuple(velocity_maps.shape),))
-            if velocity_maps.shape[-2:] != (h, w):
-                flat = velocity_maps.view(
-                    batch_size * t_len, 1,
-                    velocity_maps.shape[-2], velocity_maps.shape[-1])
-                flat = F.interpolate(
-                    flat, size=(h, w), mode='bilinear', align_corners=False)
-                velocity_maps = flat.view(batch_size, t_len, 1, h, w)
-            occupancy[:, :, 6:7] = velocity_maps
+        if self.motion_mode == 'none':
+            assert occupancy.shape[2] == 6, (
+                "motion_mode=none requires 6 occupancy channels, got %d"
+                % occupancy.shape[2])
+        elif self.motion_mode == 'gated_speed':
+            assert gated_speed_maps is not None, (
+                "motion_mode=gated_speed requires gated_speed_maps")
+            assert gated_speed_maps.shape[:2] == (batch_size, t_len), (
+                "gated_speed_maps shape %s does not match occupancy batch/time"
+                % (tuple(gated_speed_maps.shape),))
+            gated_speed_maps = self._resize_motion_map(
+                gated_speed_maps, batch_size, t_len, h, w)
+            occupancy[:, :, 6:7] = gated_speed_maps
+            assert occupancy.shape[2] == 7, (
+                "motion_mode=gated_speed requires 7 occupancy channels, got %d"
+                % occupancy.shape[2])
+        elif self.motion_mode == 'confidence_gated_speed':
+            assert confidence_maps is not None and gated_speed_maps is not None, (
+                "motion_mode=confidence_gated_speed requires confidence_maps "
+                "and gated_speed_maps")
+            assert confidence_maps.shape[:2] == (batch_size, t_len), (
+                "confidence_maps shape %s does not match occupancy batch/time"
+                % (tuple(confidence_maps.shape),))
+            assert gated_speed_maps.shape[:2] == (batch_size, t_len), (
+                "gated_speed_maps shape %s does not match occupancy batch/time"
+                % (tuple(gated_speed_maps.shape),))
+            confidence_maps = self._resize_motion_map(
+                confidence_maps, batch_size, t_len, h, w)
+            gated_speed_maps = self._resize_motion_map(
+                gated_speed_maps, batch_size, t_len, h, w)
+            occupancy[:, :, 6:7] = confidence_maps
+            occupancy[:, :, 7:8] = gated_speed_maps
+            assert occupancy.shape[2] == 8, (
+                "motion_mode=confidence_gated_speed requires 8 occupancy "
+                "channels, got %d" % occupancy.shape[2])
+        else:
+            raise ValueError("Unhandled motion_mode %r" % self.motion_mode)
 
         return occupancy, target
 
@@ -362,12 +460,13 @@ class PointPillar(nn.Module):
                 "Expected %d history BEV frames, got %d"
                 % (self.input_frame, feature_seq.shape[1]))
 
-            velocity_maps = None
-            if self.use_velocity_in_planning:
-                # Predicted speed from frozen det heads (before planner adapter).
+            confidence_maps = None
+            gated_speed_maps = None
+            if self.motion_mode != 'none':
+                # Motion from frozen det heads (before planner adapter).
                 with torch.no_grad():
-                    velocity_maps = self.history_predicted_velocity_maps(
-                        feature_seq)
+                    confidence_maps, gated_speed_maps = (
+                        self.history_predicted_motion_maps(feature_seq))
 
             # Planner-owned adapter (trainable) after frozen BEV features.
             b, t, c, h, w = feature_seq.shape
@@ -379,7 +478,8 @@ class PointPillar(nn.Module):
 
             occupancy, target = self.build_v2xverse_occupancy(
                 data_dict, h, w, feature_seq.device,
-                velocity_maps=velocity_maps)
+                confidence_maps=confidence_maps,
+                gated_speed_maps=gated_speed_maps)
 
             # Leakage guards (training + eval): target must not be GT endpoint.
             if 'future_waypoints' in data_dict:

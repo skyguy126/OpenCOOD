@@ -2,6 +2,7 @@
 # Adapted from V2Xverse WaypointPlanner_e2e:
 # https://github.com/CollaborativePerception/V2Xverse/blob/main/codriving/models/planning_end2end.py
 
+import math
 from typing import Dict, Iterable
 
 import torch
@@ -54,12 +55,18 @@ class V2XVersePlanningHead(nn.Module):
     Expects input_frame=5 and output_points=10 (Conv3D temporal kernels;
     decoder MLP outputs 20 = 10*2).
 
-    occupancy_channels=6 matches upstream V2Xverse. Set to 7 to append a
-    predicted-velocity BEV channel (ablation); all other layers are unchanged.
+    occupancy_channels in {6, 7, 8} — channel semantics come from motion_mode
+    in the parent PointPillar, not from channel count alone.
+
+    pooling:
+      - attention: hard attention-weighted sum (historical attn planner)
+      - residual_attention: convex mix of mean and attention (alpha~0.10 init)
+      - mean: uniform spatial mean (also available here for a unified API)
     """
 
     def __init__(self, feature_dir: int = 384, input_frame: int = 5,
-                 output_points: int = 10, occupancy_channels: int = 6):
+                 output_points: int = 10, occupancy_channels: int = 6,
+                 pooling: str = 'attention'):
         super(V2XVersePlanningHead, self).__init__()
         assert input_frame == 5, (
             "V2XVersePlanningHead requires input_frame=5 "
@@ -68,12 +75,18 @@ class V2XVersePlanningHead(nn.Module):
         assert output_points == 10, (
             "V2XVersePlanningHead requires output_points=10"
         )
-        assert occupancy_channels in (6, 7), (
-            "occupancy_channels must be 6 (baseline) or 7 (+velocity)"
+        assert occupancy_channels in (6, 7, 8), (
+            "occupancy_channels must be 6, 7, or 8 (got %d)"
+            % occupancy_channels
+        )
+        assert pooling in ('mean', 'attention', 'residual_attention'), (
+            "pooling must be mean, attention, or residual_attention, got %r"
+            % pooling
         )
         self.input_frame = input_frame
         self.output_points = output_points
         self.occupancy_channels = occupancy_channels
+        self.pooling = pooling
 
         height_feat_size = occupancy_channels
         self.conv_pre_1 = nn.Conv2d(
@@ -118,23 +131,47 @@ class V2XVersePlanningHead(nn.Module):
 
         self.bn3_1 = nn.BatchNorm2d(256)
 
-        # Learned spatial attention pooling replacing V2XVerse global mean
-        # pooling (x_3.mean over H×W). 1×1 MLP scorer: 256 -> 64 -> 1.
-        self.spatial_attn = nn.Sequential(
-            nn.Conv2d(256, 64, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, kernel_size=1),
-        )
-        # Zero-init final scorer so logits start at 0 → uniform softmax ≈ mean
-        # pooling; attention only departs from the V2XVerse baseline when useful.
-        nn.init.zeros_(self.spatial_attn[-1].weight)
-        nn.init.zeros_(self.spatial_attn[-1].bias)
+        self.spatial_attn = None
+        self.attn_mix_logit = None
+        if pooling in ('attention', 'residual_attention'):
+            # 1×1 MLP scorer: 256 -> 64 -> 1.
+            self.spatial_attn = nn.Sequential(
+                nn.Conv2d(256, 64, kernel_size=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 1, kernel_size=1),
+            )
+            # Zero-init final scorer so logits start at 0 → uniform softmax ≈ mean.
+            nn.init.zeros_(self.spatial_attn[-1].weight)
+            nn.init.zeros_(self.spatial_attn[-1].bias)
+
+        if pooling == 'residual_attention':
+            # alpha ~= 0.10 so training starts near known-good mean pooling.
+            self.attn_mix_logit = nn.Parameter(
+                torch.tensor(math.log(0.1 / 0.9), dtype=torch.float32)
+            )
 
         self.decoder = MLP(256 + 128, 20, hid_feat=(1025, 512))
         self.target_encoder = MLP(2, 128, hid_feat=(16, 64))
 
+    def pool_spatial(self, x_3: torch.Tensor) -> torch.Tensor:
+        """Pool [B,256,H,W] -> [B,256] according to self.pooling."""
+        if self.pooling == 'mean':
+            return x_3.mean(dim=(2, 3))
+
+        mean_feature = x_3.mean(dim=(2, 3))
+        attn_logits = self.spatial_attn(x_3)  # [B, 1, H, W]
+        attn = attn_logits.flatten(2).softmax(dim=-1)  # [B, 1, H*W]
+        attn_feature = (x_3.flatten(2) * attn).sum(dim=-1)  # [B, 256]
+
+        if self.pooling == 'attention':
+            return attn_feature
+
+        # residual_attention: stable convex blend with mean.
+        alpha = torch.sigmoid(self.attn_mix_logit)
+        return (1.0 - alpha) * mean_feature + alpha * attn_feature
+
     def forward(self, input_data: Dict) -> Dict:
-        occupancy = input_data["occupancy"]  # [B, 5, C, H, W], C in {6, 7}
+        occupancy = input_data["occupancy"]  # [B, 5, C, H, W], C in {6, 7, 8}
         batch, seq, c, h, w = occupancy.size()
         assert c == self.occupancy_channels, (
             "occupancy has %d channels, expected %d"
@@ -188,12 +225,9 @@ class V2XVersePlanningHead(nn.Module):
 
         x_3 = F.relu(self.bn3_1(self.conv3_1(x_2)))
 
-        # Learned spatial attention pooling (replaces V2XVerse uniform mean).
-        # One score per spatial cell from 256-D x_3; softmax over H×W; weighted
-        # sum yields the same 256-D feature for the waypoint decoder.
-        attn_logits = self.spatial_attn(x_3)  # [B, 1, H, W]
-        attn = attn_logits.flatten(2).softmax(dim=-1)  # [B, 1, H*W]
-        feature = (x_3.flatten(2) * attn).sum(dim=-1)  # [B, 256]
+        feature = self.pool_spatial(x_3)
+        assert feature.shape == (batch, 256), (
+            "pooled feature must be [B,256], got %s" % (tuple(feature.shape),))
 
         feature_target = self.target_encoder(input_data["target"])
         future_waypoints = self.decoder(

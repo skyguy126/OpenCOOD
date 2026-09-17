@@ -55,8 +55,12 @@ class V2XVerseMeanPlanningHead(nn.Module):
     V2Xverse WaypointPlanner_e2e with uniform spatial mean pooling.
 
     Expects input_frame=5 and output_points=10 (Conv3D temporal kernels;
-    decoder MLP outputs 20 = 10*2). occupancy_channels=6 matches upstream
-    V2Xverse (no velocity channel).
+    decoder MLP outputs 20 = 10*2).
+
+    occupancy_channels in {6, 7, 8}. Channel semantics are set by
+    planning_head.motion_mode on the parent model (not inferred from C).
+    Kept as a separate class (no spatial_attn params) so historical
+    mean-pool checkpoints remain loadable.
     """
 
     def __init__(self, feature_dir: int = 384, input_frame: int = 5,
@@ -69,12 +73,14 @@ class V2XVerseMeanPlanningHead(nn.Module):
         assert output_points == 10, (
             "V2XVerseMeanPlanningHead requires output_points=10"
         )
-        assert occupancy_channels in (6, 7), (
-            "occupancy_channels must be 6 (baseline) or 7 (+velocity)"
+        assert occupancy_channels in (6, 7, 8), (
+            "occupancy_channels must be 6, 7, or 8 (got %d)"
+            % occupancy_channels
         )
         self.input_frame = input_frame
         self.output_points = output_points
         self.occupancy_channels = occupancy_channels
+        self.pooling = 'mean'
 
         height_feat_size = occupancy_channels
         self.conv_pre_1 = nn.Conv2d(
@@ -123,7 +129,7 @@ class V2XVerseMeanPlanningHead(nn.Module):
         self.target_encoder = MLP(2, 128, hid_feat=(16, 64))
 
     def forward(self, input_data: Dict) -> Dict:
-        occupancy = input_data["occupancy"]  # [B, 5, C, H, W], C in {6, 7}
+        occupancy = input_data["occupancy"]  # [B, 5, C, H, W], C in {6, 7, 8}
         batch, seq, c, h, w = occupancy.size()
         assert c == self.occupancy_channels, (
             "occupancy has %d channels, expected %d"
