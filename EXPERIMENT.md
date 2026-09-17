@@ -4,14 +4,17 @@ Ablation for velocity-conditioned planning: **baseline planner** = V2XVerse unif
 
 Env: `conda activate v2xreal`
 
-| ID | Backbone | Planner | ADE / FDE |
-|----|----------|---------|-----------|
-| 1 | detection only backbone | baseline planner (mean pool; no speed channel) | 0.5919 / 1.2634 |
-| 2 | velocity backbone | baseline planner (mean pool; **no** speed channel) | 0.6403 / 1.3899 |
-| 3 | velocity backbone | baseline planner (mean pool; **with** speed channel) | TODO |
-| 4 | velocity backbone | attention planner (spatial attn; **with** speed channel) | 1.3394 / 2.4652 |
+| ID | Backbone | Planner | Speed channel in occupancy | ADE / FDE |
+|----|----------|---------|----------------------------|-----------|
+| 1 | detection only backbone | baseline (mean pool) | no | 0.5919 / 1.2634 |
+| 2 | velocity backbone | baseline (mean pool) | no | 0.6403 / 1.3899 |
+| 3 | velocity backbone | baseline (mean pool) | **yes** | 0.7395 / 1.5968 |
+| 4 | velocity backbone | attention (spatial attn) | **yes** | 1.3394 / 2.4652 |
 
-Rows 2–4 share the same frozen velocity backbone (`x2_multiframe`). They differ only in the planner head: mean vs attention, and whether predicted speed is occupancy channel 6.
+Rows 2–4 share the same frozen velocity backbone (`x2_multiframe`). Differences:
+- **2 vs 3:** same mean-pool planner; only whether predicted speed is occupancy channel 6
+- **3 vs 4:** same speed channel; mean-pool vs attention planner
+- **2 vs 4:** attention + speed channel vs mean-pool without speed channel
 
 
 ---
@@ -76,13 +79,18 @@ CUDA_VISIBLE_DEVICES=0 python opencood/tools/train.py --hypes_yaml opencood/hype
 
 # Experiment 3 — Velocity backbone + baseline planner + velocity occupancy
 
-Same as Experiment 2, but predicted speed is wired into planner occupancy (channel 6). Control for Experiment 4.
+Same as Experiment 2, but predicted speed is wired into planner occupancy (channel 6). Control for Experiment 4. Eval: epoch 50, held-out test (`n=2170`), `planning_only_eval_ep50.csv`.
 
 **Backbone:** reuse `x2_multiframe` (Experiment 2).
 
-**Planner** (running)
+**Planner**
 ```bash
 CUDA_VISIBLE_DEVICES=2 python opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_baseline_mean_vel.yaml --pretrained_dir /home/project/x2_multiframe --model_dir /home/project/path_v2xverse_mean_vel --cpu_affinity 20-39
+```
+
+**Eval**
+```bash
+CUDA_VISIBLE_DEVICES=2 python -u opencood/eval/planning_eval.py --model_dir /home/project/path_v2xverse_mean_vel --num_workers 2 --save_csv --csv_name planning_only_eval_ep50.csv 2>&1 | tee /home/project/path_v2xverse_mean_vel/planning_only_eval_ep50_output.txt
 ```
 
 | | Backbone | Planner |
@@ -97,7 +105,7 @@ CUDA_VISIBLE_DEVICES=2 python opencood/tools/train.py --hypes_yaml opencood/hype
 | Detection | AP@0.7 | 0.85 |
 | Velocity | Speed MAE | 0.549 m/s |
 | Velocity | Speed RMSE | 0.878 m/s |
-| Planning | ADE / FDE | TODO |
+| Planning | ADE / FDE | 0.7395 / 1.5968 |
 
 ---
 
