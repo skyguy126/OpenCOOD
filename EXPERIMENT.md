@@ -1,84 +1,30 @@
 # Experiments
 
-Planner change: V2XVerse uniform spatial mean pooling → learned spatial attention pooling (`256 → 64 → 1`, softmax over H×W). Velocity is **not** fed into the planner in any experiment. Experiments 3–4 are the original mean-pool baselines (det-only vs velocity backbone).
+Ablation for velocity-conditioned planning: **baseline planner** = V2XVerse uniform spatial mean pooling; **attention planner** = learned spatial attention pooling (`256 → 64 → 1`, softmax over H×W, zero-init scorer). **Velocity in occupancy** = frozen-backbone predicted speed as planner channel 6.
 
 Env: `conda activate v2xreal`
 
+| ID | Backbone | Planner | Velocity in occupancy | ADE / FDE |
+|----|----------|---------|----------------------|-----------|
+| 1 | detection only backbone | baseline planner | no | 0.5919 / 1.2634 |
+| 2 | velocity backbone | baseline planner | no | 0.6403 / 1.3899 |
+| 3 | velocity backbone | baseline planner | yes | TODO |
+| 4 | velocity backbone | attention planner | yes | 1.3394 / 2.4652 |
+
 ---
 
-# Experiment 1 — Backbone without velocity
+# Experiment 1 — Detection only backbone + baseline planner
 
-Detection-only dual-frame backbone (done), then frozen-backbone attention planner (done, epoch 50).
+Frozen-backbone mean-pool planner on the detection-only backbone. No velocity in planner occupancy.
 
 **Backbone**
 ```bash
-cd /media/Disk2/OpenCOOD_vamsi_2
 CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_x2_det_only.yaml --model_dir /home/project/x2_detection_only
 ```
 
 **Planner**
 ```bash
-test ! -e /home/project/path_v2xverse_det_only_attn && CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_baseline_det_only_attn.yaml --pretrained_dir /home/project/x2_detection_only --model_dir /home/project/path_v2xverse_det_only_attn
-```
-
-| | Backbone | Planner |
-|--|----------|---------|
-| Config | `point_pillar_early_fusion_x2_det_only.yaml` | `point_pillar_early_fusion_baseline_det_only_attn.yaml` |
-| Output | `x2_detection_only` | `path_v2xverse_det_only_attn` |
-
-| Task | Metric | Value |
-|------|--------|-------|
-| Detection | AP@0.3 | 0.90 |
-| Detection | AP@0.5 | 0.89 |
-| Detection | AP@0.7 | 0.85 |
-| Planning | ADE / FDE | 0.7655 / 1.6115 |
-
----
-
-# Experiment 2 — Backbone with velocity
-
-Det+velocity dual-frame backbone (done), then frozen-backbone attention planner (done, epoch 50).
-
-**Backbone**
-```bash
-cd /media/Disk2/OpenCOOD_vamsi_2
-CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_x2.yaml --model_dir /home/project/x2_multiframe
-```
-
-**Planner**
-```bash
-test ! -e /home/project/path_v2xverse_attn && CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_baseline_attn.yaml --pretrained_dir /home/project/x2_multiframe --model_dir /home/project/path_v2xverse_attn
-```
-
-| | Backbone | Planner |
-|--|----------|---------|
-| Config | `point_pillar_early_fusion_x2.yaml` | `point_pillar_early_fusion_baseline_attn.yaml` |
-| Output | `x2_multiframe` | `path_v2xverse_attn` |
-
-| Task | Metric | Value |
-|------|--------|-------|
-| Detection | AP@0.3 | 0.92 |
-| Detection | AP@0.5 | 0.91 |
-| Detection | AP@0.7 | 0.85 |
-| Velocity | Speed MAE | 0.549 m/s |
-| Velocity | Speed RMSE | 0.878 m/s |
-| Planning | ADE / FDE | 0.6522 / 1.4261 |
-
----
-
-# Experiment 3 — Original V2Xverse planner (no-velocity backbone)
-
-Frozen-backbone mean-pool planner (pre-attention V2Xverse head) on the detection-only backbone. Single process on GPU 0; batch 2. CPU affinity `0-11,40-51` (GPU 0 NUMA, clear of the other jobs).
-
-**Backbone**
-```bash
-cd /media/Disk2/OpenCOOD_vamsi_2
-CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_x2_det_only.yaml --model_dir /home/project/x2_detection_only
-```
-
-**Planner**
-```bash
-test ! -e /home/project/path_v2xverse_det_only && CUDA_VISIBLE_DEVICES=0 python opencood/tools/train_v2xverse_mean_planner.py
+CUDA_VISIBLE_DEVICES=0 python opencood/tools/train_v2xverse_mean_planner.py
 ```
 
 | | Backbone | Planner |
@@ -95,17 +41,16 @@ test ! -e /home/project/path_v2xverse_det_only && CUDA_VISIBLE_DEVICES=0 python 
 
 ---
 
-# Experiment 4 — Original V2Xverse planner (velocity backbone)
+# Experiment 2 — Velocity backbone + baseline planner (no velocity occupancy)
 
-Frozen-backbone mean-pool planner (pre-attention V2Xverse head) on the det+velocity backbone. Same recipe as Experiment 3, but pretrained from `x2_multiframe`. Checkpoint: `/home/project/path_v2xverse` (epoch 50); ADE/FDE from eval copy `path_v2xverse_vamsi_eval_08_23` (`n=2170`).
+Frozen-backbone mean-pool planner on the det+velocity backbone. Velocity is **not** fed into planner occupancy (6 channels). Checkpoint `/home/project/path_v2xverse`; ADE/FDE from `path_v2xverse_vamsi_eval_08_23` (`n=2170`).
 
 **Backbone**
 ```bash
-cd /media/Disk2/OpenCOOD_vamsi_2
 CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_x2.yaml --model_dir /home/project/x2_multiframe
 ```
 
-**Planner** (historical single-GPU run; head was mean-pool in `point_pillar` before the attention change)
+**Planner**
 ```bash
 CUDA_VISIBLE_DEVICES=0 python opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_baseline.yaml --model_dir /home/project/path_v2xverse --pretrained_dir /home/project/x2_multiframe
 ```
@@ -123,3 +68,62 @@ CUDA_VISIBLE_DEVICES=0 python opencood/tools/train.py --hypes_yaml opencood/hype
 | Velocity | Speed MAE | 0.549 m/s |
 | Velocity | Speed RMSE | 0.878 m/s |
 | Planning | ADE / FDE | 0.6403 / 1.3899 |
+
+---
+
+# Experiment 3 — Velocity backbone + baseline planner + velocity occupancy
+
+Same as Experiment 2, but predicted speed is wired into planner occupancy (channel 6). Control for Experiment 4.
+
+**Backbone:** reuse `x2_multiframe` (Experiment 2).
+
+**Planner** (running)
+```bash
+CUDA_VISIBLE_DEVICES=2 python opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_baseline_mean_vel.yaml --pretrained_dir /home/project/x2_multiframe --model_dir /home/project/path_v2xverse_mean_vel --cpu_affinity 20-39
+```
+
+| | Backbone | Planner |
+|--|----------|---------|
+| Config | `point_pillar_early_fusion_x2.yaml` | `point_pillar_early_fusion_baseline_mean_vel.yaml` |
+| Output | `x2_multiframe` | `path_v2xverse_mean_vel` |
+
+| Task | Metric | Value |
+|------|--------|-------|
+| Detection | AP@0.3 | 0.92 |
+| Detection | AP@0.5 | 0.91 |
+| Detection | AP@0.7 | 0.85 |
+| Velocity | Speed MAE | 0.549 m/s |
+| Velocity | Speed RMSE | 0.878 m/s |
+| Planning | ADE / FDE | TODO |
+
+---
+
+# Experiment 4 — Velocity backbone + attention planner + velocity occupancy
+
+Method: attention planner with predicted speed in occupancy on the velocity backbone. Eval: epoch 50, held-out test (`n=2170`), `planning_only_eval_ep50.csv`.
+
+**Backbone:** reuse `x2_multiframe` (Experiment 2).
+
+**Planner**
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=2 --master_port=29511 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_baseline_attn_vel.yaml --pretrained_dir /home/project/x2_multiframe --model_dir /home/project/path_v2xverse_attn_vel --cpu_affinity 0-19
+```
+
+**Eval**
+```bash
+CUDA_VISIBLE_DEVICES=1 python -u opencood/eval/planning_eval.py --model_dir /home/project/path_v2xverse_attn_vel --save_csv --csv_name planning_only_eval_ep50.csv 2>&1 | tee /home/project/path_v2xverse_attn_vel/planning_only_eval_ep50_output.txt
+```
+
+| | Backbone | Planner |
+|--|----------|---------|
+| Config | `point_pillar_early_fusion_x2.yaml` | `point_pillar_early_fusion_baseline_attn_vel.yaml` |
+| Output | `x2_multiframe` | `path_v2xverse_attn_vel` |
+
+| Task | Metric | Value |
+|------|--------|-------|
+| Detection | AP@0.3 | 0.92 |
+| Detection | AP@0.5 | 0.91 |
+| Detection | AP@0.7 | 0.85 |
+| Velocity | Speed MAE | 0.549 m/s |
+| Velocity | Speed RMSE | 0.878 m/s |
+| Planning | ADE / FDE | 1.3394 / 2.4652 |
