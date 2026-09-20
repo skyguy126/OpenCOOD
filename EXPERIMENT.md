@@ -10,12 +10,12 @@ Env: `conda activate v2xreal`
 
 ## Main ablation
 
-| ID        | Motion representation    | Pooling            | ADE / FDE       | Status                        |
-| --------- | ------------------------ | ------------------ | --------------- | ----------------------------- |
-| Reference | none                     | mean               | 0.6403 / 1.3899 | completed historical baseline |
-| 1         | confidence-gated speed   | mean               | TODO            | TODO: train                   |
-| 2         | confidence + gated speed | mean               | TODO            | TODO: train                   |
-| 3         | confidence + gated speed | residual attention | TODO            | TODO: train                   |
+| ID        | Motion representation    | Pooling            | ADE / FDE       | Status                                      |
+| --------- | ------------------------ | ------------------ | --------------- | ------------------------------------------- |
+| Reference | none                     | mean               | 0.6403 / 1.3899 | completed historical baseline               |
+| 1         | confidence-gated speed   | mean               | 1.0599 / 2.0063 | completed (`n=2170`, epoch 50)              |
+| 2         | confidence + gated speed | mean               | 0.7706 / 1.6203 | completed (`n=2170`, epoch 50)              |
+| 3         | confidence + gated speed | residual attention | 0.7191 / 1.5043 | completed (`n=2170`, epoch 50)              |
 
 ### Experiment 1
 
@@ -100,7 +100,7 @@ CUDA_VISIBLE_DEVICES=0 python opencood/tools/train.py \
 | Output | `/home/project/path_v2xverse_gated_speed` |
 | Motion | `gated_speed` (7 ch) |
 | Pooling | `mean` |
-| ADE / FDE | TODO |
+| ADE / FDE | 1.0599 / 2.0063 |
 
 ---
 
@@ -121,7 +121,7 @@ CUDA_VISIBLE_DEVICES=1 python opencood/tools/train.py \
 | Output | `/home/project/path_v2xverse_conf_motion` |
 | Motion | `confidence_gated_speed` (8 ch) |
 | Pooling | `mean` |
-| ADE / FDE | TODO |
+| ADE / FDE | 0.7706 / 1.6203 |
 
 ---
 
@@ -142,7 +142,7 @@ CUDA_VISIBLE_DEVICES=2 python opencood/tools/train.py \
 | Output | `/home/project/path_v2xverse_conf_motion_resattn` |
 | Motion | `confidence_gated_speed` (8 ch) |
 | Pooling | `residual_attention` |
-| ADE / FDE | TODO |
+| ADE / FDE | 0.7191 / 1.5043 |
 
 ---
 
