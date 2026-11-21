@@ -75,24 +75,28 @@ def main():
               'ignoring pretrained_dir=%s' % (opt.model_dir, pretrained_dir))
         pretrained_dir = ''
 
-    # Resume an existing run (uses model_dir/config.yaml).
+    # Resume an existing run (uses model_dir/config.yaml) only when that
+    # config already exists. A fresh --model_dir with no config.yaml starts
+    # from --hypes_yaml (config is written later when checkpoints are set up).
     # Overlay DataLoader / eval schedule keys from the explicitly passed
     # --hypes_yaml so patches take effect without rewriting the saved config.
     if opt.model_dir and not pretrained_dir:
-        repo_train_params = dict(train_params)
-        hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
-        train_params = hypes.get('train_params', {})
-        overlay_keys = (
-            'num_workers', 'val_num_workers', 'pin_memory',
-            'prefetch_factor', 'val_prefetch_factor',
-            'persistent_workers', 'val_persistent_workers',
-            'max_workers_per_rank_train', 'max_workers_per_rank_val',
-            'eval_freq', 'save_freq',
-        )
-        for key in overlay_keys:
-            if key in repo_train_params:
-                train_params[key] = repo_train_params[key]
-        hypes['train_params'] = train_params
+        saved_config = os.path.join(opt.model_dir, 'config.yaml')
+        if os.path.exists(saved_config):
+            repo_train_params = dict(train_params)
+            hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
+            train_params = hypes.get('train_params', {})
+            overlay_keys = (
+                'num_workers', 'val_num_workers', 'pin_memory',
+                'prefetch_factor', 'val_prefetch_factor',
+                'persistent_workers', 'val_persistent_workers',
+                'max_workers_per_rank_train', 'max_workers_per_rank_val',
+                'eval_freq', 'save_freq',
+            )
+            for key in overlay_keys:
+                if key in repo_train_params:
+                    train_params[key] = repo_train_params[key]
+            hypes['train_params'] = train_params
 
     pretrained_dir = opt.pretrained_dir or train_params.get('pretrained_dir', '')
     if resume_existing:

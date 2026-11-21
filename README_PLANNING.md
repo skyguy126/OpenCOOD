@@ -1,14 +1,38 @@
 # Planning Results: Frozen Backbone + V2XVerse Planner
 
-This note compares two setups that share the same V2XVerse-style planning module. In both cases the perception backbone is frozen, and only the planner is trained. The planner uses the original occupancy representation (no speed channel is passed into planning). The only difference is whether the frozen backbone was trained with velocity estimation.
+This note compares setups that share the same V2XVerse-style planning module. In each case the perception backbone is frozen, and only the planner is trained. The planner uses the original occupancy representation (no speed channel is passed into planning).
 
 **Metric:** ADE / FDE (meters). Lower is better.
 
 ---
 
-## 1. Our backbone without velocity + V2XVerse planner
+## 0. Single-frame detection-only backbone + V2XVerse planner
 
-The backbone is our detection-only model (no velocity head). Its weights are frozen. The V2XVerse planning module is trained on top.
+Baseline without velocity and without multi-frame input. The backbone is a single-frame detection-only PointPillar (no velocity head, `dual_frame: false`). Its weights are frozen. The V2XVerse planning module is trained on top.
+
+![Exp 0 flow: single-frame detection-only backbone + V2XVerse planner](docs/figures/planning_exp0_single_frame_det_only.jpg)
+
+Frozen backbone itself (no planner):
+
+| Task | Metric | Value |
+|------|--------|-------|
+| Detection | AP @ 0.3 / 0.5 / 0.7 | pending (`x2_detection_single`) |
+| Velocity | Speed MAE / RMSE | — |
+
+Planner (frozen backbone + V2XVerse planner):
+
+| Metric | Value |
+|--------|-------|
+| ADE    | pending (`path_v2xverse_det_only_single`) |
+| FDE    | pending |
+
+---
+
+## 1. Multi-frame detection-only backbone + V2XVerse planner
+
+The backbone is our detection-only model (no velocity head) with dual-frame input. Its weights are frozen. The V2XVerse planning module is trained on top.
+
+![Exp 1 flow: multi-frame detection-only backbone + V2XVerse planner](docs/figures/planning_exp1_det_only_flow.jpg)
 
 Frozen backbone itself (no planner):
 
@@ -26,9 +50,11 @@ Planner (frozen backbone + V2XVerse planner):
 
 ---
 
-## 2. Our backbone with velocity + V2XVerse planner
+## 2. Multi-frame velocity backbone + V2XVerse planner
 
-The backbone is our model trained with velocity estimation. Its weights are frozen. The same V2XVerse planning module is trained on top, still without feeding predicted speed into the planner.
+The backbone is our model trained with velocity estimation (dual-frame). Its weights are frozen. The same V2XVerse planning module is trained on top, still without feeding predicted speed into the planner.
+
+![Exp 2 flow: velocity dual-frame backbone + V2XVerse planner (speed unused)](docs/figures/planning_exp2_velocity_backbone_flow.jpg)
 
 Frozen backbone itself (no planner):
 
@@ -46,4 +72,4 @@ Planner (frozen backbone + V2XVerse planner):
 
 ---
 
-**Takeaway:** With the same V2XVerse planner and no motion input to planning, the detection-only frozen backbone outperforms the velocity-trained frozen backbone on ADE and FDE. Detection AP is slightly higher for the velocity-trained backbone.
+**Takeaway:** With the same V2XVerse planner and no motion input to planning, the multi-frame detection-only frozen backbone outperforms the velocity-trained frozen backbone on ADE and FDE. Detection AP is slightly higher for the velocity-trained backbone. The single-frame detection-only baseline (section 0) is pending.
