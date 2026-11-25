@@ -16,7 +16,7 @@ This note compares four setups that share the same V2XVerse-style planning modul
 | 0 | Detection-only | single | no | 0.93 / 0.92 / 0.86 | — | 0.7089 / 1.5281 |
 | 1 | Detection-only | dual | no | 0.93 / 0.93 / 0.88 | — | 0.5919 / 1.2634 |
 | 2 | Detection + velocity | dual | yes (unused by planner) | 0.92 / 0.91 / 0.85 | 0.549 / 0.878 m/s | 0.6403 / 1.3899 |
-| 3 | Detection + velocity | dual | yes (used by planner) | 0.92 / 0.91 / 0.85 | 0.549 / 0.878 m/s | TODO |
+| 3 | Detection + velocity | dual | yes (used by planner) | 0.92 / 0.91 / 0.85 | 0.549 / 0.878 m/s | 0.7706 / 1.6203 |
 
 ---
 
@@ -101,12 +101,12 @@ Planner (frozen backbone + V2XVerse planner):
 
 | Metric | Value |
 |--------|-------|
-| ADE    | TODO |
-| FDE    | TODO |
+| ADE    | 0.7706 |
+| FDE    | 1.6203 |
 
 ---
 
 **Takeaway:**
 - **0 → 1:** Dual-frame fusion cuts ADE 0.709 → 0.592.
 - **1 → 2:** Velocity training without using speed raises ADE 0.592 → 0.640.
-- **2 → 3:** Confidence-gated speed into the planner (TODO).
+- **2 → 3:** Confidence-gated speed into the planner raises ADE 0.640 → 0.771.
