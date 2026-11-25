@@ -1,5 +1,9 @@
 # Planning Results: Frozen Backbone + V2XVerse Planner
 
+**Status: TODO** — detection AP must be re-evaluated on a shared validate split before the table below is final (Exp 2 AP was previously measured on the OPV2V test set; Exp 0–1 used validate).
+
+**Dataset:** OPV2V. Backbones and planners are trained on the **train** split. Detection AP is reported on the **validate** split (not held out from training hyperparameter choices). Planning ADE / FDE is reported on the **test** split (`n=2170`), which is held out and never used for training.
+
 This note compares three setups that share the same V2XVerse-style planning module. In each case the perception backbone is frozen, and only the planner is trained. The planner uses the original 6-channel occupancy representation (no speed channel is passed into planning).
 
 The series isolates backbone frame count and velocity training. Experiments 1–2 are the dual-frame pair (same architecture; only velocity training differs). Experiment 0 is the single-frame control:
