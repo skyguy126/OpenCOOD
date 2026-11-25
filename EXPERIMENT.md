@@ -49,7 +49,17 @@ These runs motivated the revised study. They remain documented as diagnostic evi
 
 The naive speed raster divided by summed detector confidence and could therefore expose unsupervised background regression values to the planner. That representation is **not** used by Experiments 1–3.
 
-Also recorded earlier (detection-only backbone, 6-channel mean planner, no motion): ADE/FDE = `0.5919 / 1.2634` (`path_v2xverse_det_only`).
+### Frozen-backbone no-motion baselines
+
+Same V2XVerse mean planner and original 6-channel occupancy (no speed fed to planning). Differences are backbone frame count and whether the backbone was trained with velocity.
+
+| Backbone | Frames | Velocity head | Detection AP @ 0.3 / 0.5 / 0.7 | ADE / FDE | Paths |
+|----------|--------|---------------|-------------------------------|-----------|-------|
+| Det-only single-frame | single (`dual_frame: false`) | no | 0.90 / 0.89 / 0.83 | 0.7089 / 1.5281 | `x2_detection_single` + `path_v2xverse_det_only_single` |
+| Det-only multi-frame | dual | no | 0.90 / 0.89 / 0.85 | 0.5919 / 1.2634 | `x2_detection_only` + `path_v2xverse_det_only` |
+| Velocity multi-frame | dual | yes | 0.92 / 0.91 / 0.85 | 0.6403 / 1.3899 | `x2_multiframe` + `path_v2xverse` / `path_v2xverse_vamsi_eval_08_23` |
+
+Single-frame det-only planning eval: epoch 50, `n=2170` (`planning_only_eval_ep50.csv`). Detection AP from `inference.py` on `x2_detection_single` epoch 30.
 
 ---
 
@@ -173,3 +183,38 @@ CUDA_VISIBLE_DEVICES=0 python opencood/tools/train.py --hypes_yaml opencood/hype
 | Velocity | Speed MAE | 0.549 m/s |
 | Velocity | Speed RMSE | 0.878 m/s |
 | Planning | ADE / FDE | 0.6403 / 1.3899 |
+
+---
+
+# Baseline — Single-frame detection-only + mean planner (no motion)
+
+Single-frame PointPillar without velocity (`dual_frame: false`, 7D boxes). Frozen backbone + V2XVerse mean planner with original 6-channel occupancy. Does not overwrite `x2_detection_only` / `path_v2xverse_det_only`.
+
+**Backbone**
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_early_fusion_det_only_single.yaml --model_dir /home/project/x2_detection_single
+```
+
+**Planner**
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 opencood/tools/train.py --hypes_yaml opencood/hypes_yaml/point_pillar_planner_det_only_single_mean.yaml --pretrained_dir /home/project/x2_detection_single --model_dir /home/project/path_v2xverse_det_only_single
+```
+
+**Eval**
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u opencood/eval/planning_eval.py --model_dir /home/project/path_v2xverse_det_only_single --save_csv --csv_name planning_only_eval_ep50.csv
+CUDA_VISIBLE_DEVICES=0 python opencood/tools/inference.py --model_dir /home/project/x2_detection_single --fusion_method early
+```
+
+| | Backbone | Planner |
+|--|----------|---------|
+| Config | `point_pillar_early_fusion_det_only_single.yaml` | `point_pillar_planner_det_only_single_mean.yaml` |
+| Output | `x2_detection_single` | `path_v2xverse_det_only_single` |
+
+| Task | Metric | Value |
+|------|--------|-------|
+| Detection | AP@0.3 | 0.90 |
+| Detection | AP@0.5 | 0.89 |
+| Detection | AP@0.7 | 0.83 |
+| Velocity | Speed MAE / RMSE | — |
+| Planning | ADE / FDE | 0.7089 / 1.5281 (`n=2170`, epoch 50) |
