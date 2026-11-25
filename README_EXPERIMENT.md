@@ -1,7 +1,5 @@
 # Planning Results: Frozen Backbone + V2XVerse Planner
 
-**Status: TODO** — detection AP must be re-evaluated on a shared validate split before the table below is final (Exp 2 AP was previously measured on the OPV2V test set; Exp 0–1 used validate).
-
 **Dataset:** OPV2V. Backbones and planners are trained on the **train** split. Detection AP is reported on the **validate** split (not held out from training hyperparameter choices). Planning ADE / FDE is reported on the **test** split (`n=2170`), which is held out and never used for training.
 
 This note compares three setups that share the same V2XVerse-style planning module. In each case the perception backbone is frozen, and only the planner is trained. The planner uses the original 6-channel occupancy representation (no speed channel is passed into planning).
@@ -18,7 +16,7 @@ The series isolates backbone frame count and velocity training. Experiments 1–
 |---|----------|--------|---------------|----------------------|------------------|-----------|
 | 0 | Detection-only | single | no | 0.90 / 0.89 / 0.83 | — | 0.7089 / 1.5281 |
 | 1 | Detection-only | dual | no | 0.90 / 0.89 / 0.85 | — | 0.5919 / 1.2634 |
-| 2 | Detection + velocity | dual | yes (unused by planner) | TODO | 0.549 / 0.878 m/s | 0.6403 / 1.3899 |
+| 2 | Detection + velocity | dual | yes (unused by planner) | 0.87 / 0.87 / 0.81 | 0.549 / 0.878 m/s | 0.6403 / 1.3899 |
 
 ---
 
@@ -76,7 +74,7 @@ Frozen backbone itself (no planner):
 
 | Task | Metric | Value |
 |------|--------|-------|
-| Detection | AP @ 0.3 / 0.5 / 0.7 | TODO |
+| Detection | AP @ 0.3 / 0.5 / 0.7 | 0.87 / 0.87 / 0.81 |
 | Velocity | Speed MAE / RMSE | 0.549 / 0.878 m/s |
 
 Planner (frozen backbone + V2XVerse planner):
@@ -88,4 +86,4 @@ Planner (frozen backbone + V2XVerse planner):
 
 ---
 
-**Takeaway:** Dual-frame temporal fusion is the largest win for planning (Exp 0 → 1: ADE 0.709 → 0.592) at nearly matched detection AP. Adding velocity training on that dual-frame backbone without feeding speed to the planner hurts planning (Exp 1 → 2: ADE 0.592 → 0.640) even though detection AP rises slightly. Best no-motion planner here remains the dual-frame detection-only backbone.
+**Takeaway:** Dual-frame temporal fusion is the largest win for planning (Exp 0 → 1: ADE 0.709 → 0.592) at nearly matched detection AP. Adding velocity training on that dual-frame backbone without feeding speed to the planner hurts planning (Exp 1 → 2: ADE 0.592 → 0.640) and also lowers detection AP on the shared validate split (0.90 / 0.89 / 0.85 → 0.87 / 0.87 / 0.81). Best no-motion planner here remains the dual-frame detection-only backbone.
