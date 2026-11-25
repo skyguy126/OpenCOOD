@@ -18,7 +18,7 @@ The series isolates backbone frame count and velocity training. Experiments 1–
 |---|----------|--------|---------------|----------------------|------------------|-----------|
 | 0 | Detection-only | single | no | 0.90 / 0.89 / 0.83 | — | 0.7089 / 1.5281 |
 | 1 | Detection-only | dual | no | 0.90 / 0.89 / 0.85 | — | 0.5919 / 1.2634 |
-| 2 | Detection + velocity | dual | yes (unused by planner) | 0.92 / 0.91 / 0.85 | 0.549 / 0.878 m/s | 0.6403 / 1.3899 |
+| 2 | Detection + velocity | dual | yes (unused by planner) | TODO | 0.549 / 0.878 m/s | 0.6403 / 1.3899 |
 
 ---
 
@@ -76,7 +76,7 @@ Frozen backbone itself (no planner):
 
 | Task | Metric | Value |
 |------|--------|-------|
-| Detection | AP @ 0.3 / 0.5 / 0.7 | 0.92 / 0.91 / 0.85 |
+| Detection | AP @ 0.3 / 0.5 / 0.7 | TODO |
 | Velocity | Speed MAE / RMSE | 0.549 / 0.878 m/s |
 
 Planner (frozen backbone + V2XVerse planner):
