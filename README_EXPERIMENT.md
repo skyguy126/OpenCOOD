@@ -9,6 +9,8 @@ This note compares four setups that share the same V2XVerse-style planning modul
 2. **Dual-frame with velocity (unused)** → backbone trained with velocity; speed not fed to the planner
 3. **Dual-frame with velocity (used)** → backbone trained with velocity; confidence-gated speed fed to the planner
 
+![Ablation overview: each experiment changes one thing vs. the previous one (green); the planner is the only trained part (orange)](docs/figures/planning_ablation_overview.png)
+
 **Metric:** ADE / FDE (meters). Lower is better. Planning eval `n=2170` (held-out test).
 
 | # | Backbone | Frames | Velocity head | AP @ 0.3 / 0.5 / 0.7 | Speed MAE / RMSE | ADE / FDE |
@@ -24,7 +26,7 @@ This note compares four setups that share the same V2XVerse-style planning modul
 
 Baseline without velocity and without dual-frame input. The backbone is a single-frame detection-only PointPillar (`dual_frame: false`, no velocity head). Its weights are frozen. The V2XVerse planning module is trained on top.
 
-![Exp 0 flow: single-frame detection-only backbone + V2XVerse planner](docs/figures/planning_exp0_single_frame_det_only.jpg)
+![Exp 0 flow: single-frame detection-only backbone + V2XVerse planner](docs/figures/planning_exp0.png)
 
 Frozen backbone itself (no planner):
 
@@ -46,7 +48,7 @@ Planner (frozen backbone + V2XVerse planner):
 
 Same as Experiment 0, except the frozen backbone uses dual-frame input and temporal fusion (still no velocity head). Dual-frame is kept so later dual-frame experiments share the same temporal architecture.
 
-![Exp 1 flow: dual-frame detection-only backbone + V2XVerse planner](docs/figures/planning_exp1_det_only_flow.jpg)
+![Exp 1 flow: dual-frame detection-only backbone + V2XVerse planner](docs/figures/planning_exp1.png)
 
 Frozen backbone itself (no planner):
 
@@ -68,7 +70,7 @@ Planner (frozen backbone + V2XVerse planner):
 
 Same dual-frame architecture as Experiment 1, but the backbone was also trained with velocity estimation. Its weights are frozen. The planner still does not receive predicted speed.
 
-![Exp 2 flow: dual-frame velocity backbone + V2XVerse planner (speed unused)](docs/figures/planning_exp2_velocity_backbone_flow.jpg)
+![Exp 2 flow: dual-frame velocity backbone + V2XVerse planner (speed unused)](docs/figures/planning_exp2.png)
 
 Frozen backbone itself (no planner):
 
@@ -88,7 +90,7 @@ Planner (frozen backbone + V2XVerse planner):
 
 ## 3. Dual-frame velocity backbone + confidence-gated speed in planner
 
-![Exp 3 flow: dual-frame velocity backbone + V2XVerse planner (speed used)](docs/figures/planning_exp3_velocity_used_flow.jpg)
+![Exp 3 flow: dual-frame velocity backbone + V2XVerse planner (speed used)](docs/figures/planning_exp3.png)
 
 Frozen backbone itself (no planner):
 
