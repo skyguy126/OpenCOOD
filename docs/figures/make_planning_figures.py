@@ -43,8 +43,8 @@ EXPS = [
     dict(
         id=1,
         title="Dual-frame det-only",
-        cells=["dual frame", "det only\n+ temporal fusion", "6-ch, no speed", "trainable\n5 hist frames"],
-        delta={0, 1},
+        cells=["dual frame", "det only", "6-ch, no speed", "trainable\n5 hist frames"],
+        delta={0},
         delta_label="+ dual-frame input",
         speed_used=False,
         ade="0.592",
